@@ -1,0 +1,21 @@
+# Product Recommendation Dashboard — Python dependencies
+# Python 3.10 or newer required
+
+# Data processing
+duckdb>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Excel output
+openpyxl>=3.1.0
+
+# Feature attribution (feature_importance.py only)
+shap>=0.44.0
+joblib>=1.3.0
