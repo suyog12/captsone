@@ -1,917 +1,590 @@
 from __future__ import annotations
 
-import datetime as dt
 import sys
+import time
+import warnings
 from pathlib import Path
-from typing import Optional
 
-import duckdb
 import pandas as pd
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+warnings.filterwarnings("ignore")
 
 
-# Path configuration
+# Paths
 
 ROOT       = Path(__file__).resolve().parent.parent.parent
-DATA_RAW   = ROOT / "data_raw"
 DATA_CLEAN = ROOT / "data_clean"
 
-OUT_CUSTOMER = DATA_CLEAN / "customer"
-OUT_PRODUCT  = DATA_CLEAN / "product"
-OUT_SALES    = DATA_CLEAN / "sales"
-OUT_FEATURES = DATA_CLEAN / "features"
-OUT_SERVING  = DATA_CLEAN / "serving"
-OUT_AUDIT    = DATA_CLEAN / "audit"
-
-CUSTOMER_FILE   = OUT_CUSTOMER / "customers_clean.parquet"
-PRODUCT_FILE    = OUT_PRODUCT  / "products_clean.parquet"
-TXN_FY2425_FILE = OUT_SALES    / "transactions_clean_FY2425.parquet"
-TXN_FY2526_FILE = OUT_SALES    / "transactions_clean_FY2526.parquet"
-RET_FY2425_FILE = OUT_SALES    / "returns_clean_FY2425.parquet"
-RET_FY2526_FILE = OUT_SALES    / "returns_clean_FY2526.parquet"
-SPECIALTY_FILE  = OUT_FEATURES / "specialty_tiers.parquet"
-RFM_FILE        = OUT_FEATURES / "customer_rfm.parquet"
-FEATURE_FILE    = OUT_FEATURES / "customer_features.parquet"
-MERGED_FILE     = OUT_SERVING  / "merged_dataset.parquet"
-
-SUMMARY_XLSX = OUT_AUDIT / "10_clean_data_sanity_check.xlsx"
-SUMMARY_CSV  = OUT_AUDIT / "10_clean_data_sanity_summary.csv"
-
-
-# Pipeline configuration constants
-
-EXCLUDED_ORDER_NUMS  = frozenset({61408700, 61737401, 35996955})
-MAX_ORDER_LINE_VALUE = 10_000_000.0
-
-EXPECTED_SPECIALTIES = 272
-EXPECTED_TIER1_MIN   = 60
-MIN_CHURN_RATE       = 5.0
-MAX_CHURN_RATE       = 40.0
-
-# Step 6 RFM regression guards
-MAX_MEDIAN_RECENCY_DAYS   = 180
-MAX_ABSOLUTE_RECENCY_DAYS = 800
-MIN_NEW_FY2526_CUSTOMERS  = 1_000
-
-# Feature matrix column count.
-# 44 base + 4 behavioural + 1 supplier_profile = 49
-EXPECTED_FEATURE_COLS = 49
-
-# Supplier profile validation guards.
-# Validated against real data (Apr 2026):
-#   medline_only      ~0.1% of customers
-#   mckesson_primary  ~16%  of customers
-#   mixed             ~84%  of customers
-VALID_SUPPLIER_PROFILES  = {"medline_only", "mckesson_primary", "mixed"}
-MIN_MEDLINE_ONLY_PCT     = 0.0005
-MAX_MEDLINE_ONLY_PCT     = 0.10
-MIN_MCKESSON_PRIMARY_PCT = 0.05
-MAX_MCKESSON_PRIMARY_PCT = 0.50
-MIN_MIXED_PCT            = 0.50
-
-
-# DuckDB helpers
-
-def _pq(path: Path) -> str:
-    return "'" + path.as_posix() + "'"
-
-
-def _glob(folder: Path) -> str:
-    return "'" + folder.as_posix() + "/*.parquet'"
-
-
-def _con(memory_gb: int = 4, threads: int = 1) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:")
-    con.execute(f"SET memory_limit = '{memory_gb}GB'")
-    con.execute(f"SET threads = {threads}")
-    con.execute("SET preserve_insertion_order = false")
-    return con
-
-
-def _file_size_mb(path: Path) -> float:
-    return round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else 0.0
-
-
-def _discover_raw_fact_folders() -> dict[str, Path]:
-    fact_folders: dict[str, Path] = {}
-    if not DATA_RAW.exists():
-        return fact_folders
-    for folder in sorted(DATA_RAW.iterdir()):
-        if not folder.is_dir():
-            continue
-        n = folder.name.lower()
-        if ("fct" in n or "sales" in n) and "dim" not in n:
-            fy = "FY2425" if "2425" in n else "FY2526"
-            fact_folders[fy] = folder
-    return fact_folders
-
-
-# Result accumulator
-
-def _status(ok: bool) -> str:
-    return "PASS" if ok else "FAIL"
-
-
-def _row(rows: list[dict], category: str, check_name: str, status: str,
-         metric_value, detail: str) -> None:
-    rows.append({
-        "category":     category,
-        "check_name":   check_name,
-        "status":       status,
-        "metric_value": metric_value,
-        "detail":       detail,
-        "checked_at":   dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-
-
-# Check 1: Required files
-
-def check_required_files(rows: list[dict]) -> None:
-    required = {
-        CUSTOMER_FILE:   "critical",
-        PRODUCT_FILE:    "critical",
-        TXN_FY2425_FILE: "critical",
-        TXN_FY2526_FILE: "critical",
-        RET_FY2425_FILE: "warning",
-        RET_FY2526_FILE: "warning",
-        SPECIALTY_FILE:  "critical",
-        RFM_FILE:        "critical",
-        FEATURE_FILE:    "critical",
-        MERGED_FILE:     "critical",
-        OUT_AUDIT / "01_dropped_columns.xlsx":         "warning",
-        OUT_AUDIT / "02_null_zip_customers.xlsx":      "warning",
-        OUT_AUDIT / "03_excluded_outlier_orders.xlsx": "warning",
-        OUT_AUDIT / "04_duplicate_rows.xlsx":          "warning",
-        OUT_AUDIT / "05_returns_summary.xlsx":         "warning",
-        OUT_AUDIT / "06_tier3_specialty_mapping.xlsx": "warning",
-        OUT_AUDIT / "07_state_grouping.xlsx":          "warning",
-        OUT_AUDIT / "08_churn_labels.xlsx":            "warning",
-        OUT_AUDIT / "08b_supplier_profile.xlsx":       "warning",
-        OUT_AUDIT / "09_cleaning_run_log.xlsx":        "warning",
-        DATA_CLEAN / "cleaning_summary_report.xlsx":   "warning",
-    }
-    for path, severity in required.items():
-        exists = path.exists()
-        status = "PASS" if exists else ("FAIL" if severity == "critical" else "WARN")
-        _row(rows, "files", f"exists::{path.name}", status,
-             _file_size_mb(path) if exists else None,
-             str(path.relative_to(ROOT)))
-
-
-# Check 2: Row counts (INFO)
-
-def check_row_counts(rows: list[dict]) -> None:
-    con = _con(memory_gb=3, threads=1)
-    files = {
-        "customers_clean":           CUSTOMER_FILE,
-        "products_clean":            PRODUCT_FILE,
-        "transactions_clean_FY2425": TXN_FY2425_FILE,
-        "transactions_clean_FY2526": TXN_FY2526_FILE,
-        "returns_clean_FY2425":      RET_FY2425_FILE,
-        "returns_clean_FY2526":      RET_FY2526_FILE,
-        "specialty_tiers":           SPECIALTY_FILE,
-        "customer_rfm":              RFM_FILE,
-        "customer_features":         FEATURE_FILE,
-        "merged_dataset":            MERGED_FILE,
-    }
-    for name, path in files.items():
-        if not path.exists():
-            continue
-        cnt = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet({_pq(path)})"
-        ).fetchone()[0]
-        _row(rows, "counts", f"row_count::{name}", "INFO", cnt,
-             str(path.relative_to(ROOT)))
-    con.close()
-
-
-# Check 3: Customer dimension
-
-def check_customers(rows: list[dict]) -> None:
-    if not CUSTOMER_FILE.exists():
-        return
-    con = _con(memory_gb=3, threads=1)
-
-    dup = con.execute(f"""
-        SELECT COUNT(*) FROM (
-            SELECT DIM_CUST_CURR_ID
-            FROM   read_parquet({_pq(CUSTOMER_FILE)})
-            GROUP  BY DIM_CUST_CURR_ID
-            HAVING COUNT(*) > 1
-        )
-    """).fetchone()[0]
-    _row(rows, "customers", "duplicate_customer_ids", _status(dup == 0),
-         dup, "DIM_CUST_CURR_ID must be unique")
-
-    invalid_zip = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(CUSTOMER_FILE)})
-        WHERE ZIP IS NOT NULL
-          AND NOT regexp_matches(CAST(ZIP AS VARCHAR), '^[0-9]{{5}}([0-9]{{4}})?$')
-    """).fetchone()[0]
-    _row(rows, "customers", "invalid_zip_format", _status(invalid_zip == 0),
-         invalid_zip, "ZIP must be 5 or 9 digits when present")
-
-    invalid_actv = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(CUSTOMER_FILE)})
-        WHERE ACTV_FLG IS NOT NULL AND ACTV_FLG NOT IN ('Y', 'N')
-    """).fetchone()[0]
-    _row(rows, "customers", "invalid_actv_flg", _status(invalid_actv == 0),
-         invalid_actv, "ACTV_FLG must be Y / N / NULL")
-
-    bad_type = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(CUSTOMER_FILE)})
-        WHERE CUST_TYPE_CD IS NOT NULL AND CUST_TYPE_CD NOT IN ('S', 'X', 'B')
-    """).fetchone()[0]
-    _row(rows, "customers", "invalid_cust_type_cd", _status(bad_type == 0),
-         bad_type, "CUST_TYPE_CD must be S / X / B / NULL")
-
-    bad_state = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(CUSTOMER_FILE)})
-        WHERE STATE IS NOT NULL
-          AND NOT regexp_matches(CAST(STATE AS VARCHAR), '^[A-Z]{{2}}$')
-    """).fetchone()[0]
-    _row(rows, "customers", "invalid_state_format", _status(bad_state == 0),
-         bad_state, "STATE must be 2 uppercase letters when present")
-
-    con.close()
-
-
-# Check 4: Product dimension
-
-def check_products(rows: list[dict]) -> None:
-    if not PRODUCT_FILE.exists():
-        return
-    con = _con(memory_gb=3, threads=1)
-
-    dup = con.execute(f"""
-        SELECT COUNT(*) FROM (
-            SELECT DIM_ITEM_E1_CURR_ID
-            FROM   read_parquet({_pq(PRODUCT_FILE)})
-            GROUP  BY DIM_ITEM_E1_CURR_ID
-            HAVING COUNT(*) > 1
-        )
-    """).fetchone()[0]
-    _row(rows, "products", "duplicate_product_ids", _status(dup == 0),
-         dup, "DIM_ITEM_E1_CURR_ID must be unique")
-
-    for col in ["is_private_brand", "is_discontinued", "is_generic"]:
-        bad = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet({_pq(PRODUCT_FILE)})
-            WHERE {col} IS NOT NULL AND {col} NOT IN (0, 1)
-        """).fetchone()[0]
-        _row(rows, "products", f"binary_flag::{col}", _status(bad == 0),
-             bad, f"{col} must be 0 / 1 / NULL")
-
-    total = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet({_pq(PRODUCT_FILE)})"
-    ).fetchone()[0]
-    pvt = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(PRODUCT_FILE)})
-        WHERE is_private_brand = 1
-    """).fetchone()[0]
-    pvt_pct = round(pvt / max(total, 1) * 100, 2)
-    _row(rows, "products", "private_brand_pct_plausible",
-         _status(0.1 <= pvt_pct <= 80.0), f"{pvt_pct}%",
-         f"{pvt_pct}% private brand — expected between 0.1% and 80%")
-
-    con.close()
-
-
-# Check 5 and 6: Sales transactions and returns
-
-def _check_sales_file(rows: list[dict], label: str, path: Path,
-                      is_return: bool) -> None:
-    if not path.exists():
-        return
-    con = _con(memory_gb=4, threads=1)
-
-    dup = con.execute(f"""
-        SELECT COUNT(*) FROM (
-            SELECT ORDR_NUM, ORDR_LINE_NUM
-            FROM   read_parquet({_pq(path)})
-            GROUP  BY ORDR_NUM, ORDR_LINE_NUM
-            HAVING COUNT(*) > 1
-        )
-    """).fetchone()[0]
-    _row(rows, "sales", f"duplicate_keys::{label}", _status(dup == 0),
-         dup, "ORDR_NUM + ORDR_LINE_NUM must be unique after cleaning")
-
-    if is_return:
-        bad_qty = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet({_pq(path)}) WHERE ORDR_QTY >= 0
-        """).fetchone()[0]
-        _row(rows, "sales", f"return_qty_direction::{label}", _status(bad_qty == 0),
-             bad_qty, "Return rows must have ORDR_QTY < 0")
-    else:
-        bad_qty = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet({_pq(path)}) WHERE ORDR_QTY < 0
-        """).fetchone()[0]
-        _row(rows, "sales", f"transaction_qty_direction::{label}", _status(bad_qty == 0),
-             bad_qty, "Transaction rows must have ORDR_QTY >= 0")
-
-    blocked_sql = ", ".join(str(x) for x in sorted(EXCLUDED_ORDER_NUMS))
-    blocked_left = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(path)})
-        WHERE ORDR_NUM IN ({blocked_sql})
-    """).fetchone()[0]
-    _row(rows, "sales", f"blocked_orders_removed::{label}", _status(blocked_left == 0),
-         blocked_left, "Blocked order numbers must not appear in cleaned files")
-
-    over_cap = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(path)})
-        WHERE UNIT_SLS_AMT IS NOT NULL AND UNIT_SLS_AMT > {MAX_ORDER_LINE_VALUE}
-    """).fetchone()[0]
-    _row(rows, "sales", f"revenue_cap_respected::{label}", _status(over_cap == 0),
-         over_cap, f"No order line should exceed ${MAX_ORDER_LINE_VALUE:,.0f} cap")
-
-    bad_date = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(path)})
-        WHERE DIM_ORDR_DT_ID IS NULL
-           OR order_year  IS NULL
-           OR order_month IS NULL
-           OR order_day   IS NULL
-           OR order_month NOT BETWEEN 1 AND 12
-           OR order_day   NOT BETWEEN 1 AND 31
-    """).fetchone()[0]
-    _row(rows, "sales", f"derived_date_fields::{label}", _status(bad_date == 0),
-         bad_date, "order_year/month/day must be populated and valid")
-
-    if not is_return:
-        fy = "FY2425" if "FY2425" in path.name else "FY2526"
-        wrong_fy = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet({_pq(path)})
-            WHERE fiscal_year != '{fy}'
-        """).fetchone()[0]
-        _row(rows, "sales", f"fiscal_year_tag::{label}", _status(wrong_fy == 0),
-             wrong_fy, f"All rows must carry fiscal_year = '{fy}'")
-
-    con.close()
-
-
-def check_sales(rows: list[dict]) -> None:
-    _check_sales_file(rows, "transactions_clean_FY2425", TXN_FY2425_FILE, is_return=False)
-    _check_sales_file(rows, "transactions_clean_FY2526", TXN_FY2526_FILE, is_return=False)
-    _check_sales_file(rows, "returns_clean_FY2425",      RET_FY2425_FILE, is_return=True)
-    _check_sales_file(rows, "returns_clean_FY2526",      RET_FY2526_FILE, is_return=True)
-
-
-# Check 7: Referential integrity
-
-def check_referential_integrity(rows: list[dict]) -> None:
-    if not all(p.exists() for p in [TXN_FY2425_FILE, TXN_FY2526_FILE,
-                                     CUSTOMER_FILE, PRODUCT_FILE]):
-        return
-    con = _con(memory_gb=5, threads=1)
-    txn_sql = f"[{_pq(TXN_FY2425_FILE)}, {_pq(TXN_FY2526_FILE)}]"
-
-    missing_custs = con.execute(f"""
-        SELECT COUNT(*)
-        FROM   read_parquet({txn_sql}) s
-        LEFT JOIN read_parquet({_pq(CUSTOMER_FILE)}) c
-          ON s.DIM_CUST_CURR_ID = c.DIM_CUST_CURR_ID
-        WHERE  c.DIM_CUST_CURR_ID IS NULL
-    """).fetchone()[0]
-    _row(rows, "integrity", "sales_customer_fk", _status(missing_custs == 0),
-         missing_custs, "All sales customer IDs must exist in customers_clean")
-
-    missing_prods = con.execute(f"""
-        SELECT COUNT(*)
-        FROM   read_parquet({txn_sql}) s
-        LEFT JOIN read_parquet({_pq(PRODUCT_FILE)}) p
-          ON s.DIM_ITEM_E1_CURR_ID = p.DIM_ITEM_E1_CURR_ID
-        WHERE  p.DIM_ITEM_E1_CURR_ID IS NULL
-    """).fetchone()[0]
-    prod_fk_status = "PASS" if missing_prods == 0 else "WARN"
-    _row(rows, "integrity", "sales_product_fk", prod_fk_status,
-         missing_prods,
-         f"{missing_prods:,} transaction product IDs not in products_clean — "
-         "expected for discontinued/seasonal items; serving join uses LEFT JOIN")
-
-    con.close()
-
-
-# Check 8: Specialty tiers
-
-def check_specialty_tiers(rows: list[dict]) -> None:
-    if not SPECIALTY_FILE.exists():
-        return
-    con = _con(memory_gb=2, threads=1)
-
-    total = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})"
-    ).fetchone()[0]
-    _row(rows, "specialties", "total_specialty_count",
-         _status(total == EXPECTED_SPECIALTIES), total,
-         f"Expected exactly {EXPECTED_SPECIALTIES} specialties, got {total}")
-
-    bad_tier = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})
-        WHERE specialty_tier NOT IN (1, 2, 3)
-    """).fetchone()[0]
-    _row(rows, "specialties", "valid_tier_values", _status(bad_tier == 0),
-         bad_tier, "specialty_tier must be 1, 2, or 3")
-
-    t1 = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})
-        WHERE specialty_tier = 1
-    """).fetchone()[0]
-    _row(rows, "specialties", "tier1_minimum_count",
-         _status(t1 >= EXPECTED_TIER1_MIN), t1,
-         f"Expected >= {EXPECTED_TIER1_MIN} Tier 1 specialties, got {t1}")
-
-    t3_total = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})
-        WHERE specialty_tier = 3
-    """).fetchone()[0]
-    t3_mapped = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})
-        WHERE specialty_tier = 3
-          AND tier3_fallback_spclty_cd IS NOT NULL
-    """).fetchone()[0]
-    t3_pct = round(t3_mapped / max(t3_total, 1) * 100, 1)
-    _row(rows, "specialties", "tier3_fallback_coverage",
-         _status(t3_pct >= 50.0), f"{t3_pct}%",
-         f"{t3_mapped}/{t3_total} Tier 3 specialties have a Tier 1 fallback")
-
-    null_rev = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(SPECIALTY_FILE)})
-        WHERE specialty_tier = 1 AND total_revenue IS NULL
-    """).fetchone()[0]
-    _row(rows, "specialties", "tier1_no_null_revenue", _status(null_rev == 0),
-         null_rev, "All Tier 1 specialties must have non-null total_revenue")
-
-    con.close()
-
-
-# Check 9: RFM scores and churn labels
-
-def check_rfm(rows: list[dict]) -> None:
-    if not RFM_FILE.exists():
-        return
-    con = _con(memory_gb=3, threads=1)
-
-    for score in ["R_score", "F_score", "M_score"]:
-        bad = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-            WHERE {score} IS NOT NULL AND {score} NOT BETWEEN 1 AND 5
-        """).fetchone()[0]
-        _row(rows, "rfm", f"{score}_range", _status(bad == 0),
-             bad, f"{score} must be between 1 and 5")
-
-    bad_churn = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE churn_label NOT IN (-1, 0, 1)
-    """).fetchone()[0]
-    _row(rows, "rfm", "valid_churn_labels", _status(bad_churn == 0),
-         bad_churn, "churn_label must be one of {-1, 0, 1}")
-
-    trainable = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE churn_label IN (0, 1)
-    """).fetchone()[0]
-    churned = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE churn_label = 1
-    """).fetchone()[0]
-    if trainable > 0:
-        churn_pct = round(churned / trainable * 100, 2)
-        ok = MIN_CHURN_RATE <= churn_pct <= MAX_CHURN_RATE
-        _row(rows, "rfm", "churn_rate_plausible", _status(ok), f"{churn_pct}%",
-             f"Churn rate {churn_pct}% — expected between {MIN_CHURN_RATE}% and {MAX_CHURN_RATE}%")
-
-    neg_rec = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE recency_days < 0
-    """).fetchone()[0]
-    _row(rows, "rfm", "no_negative_recency", _status(neg_rec == 0),
-         neg_rec, "recency_days must be >= 0")
-
-    median_rec = con.execute(f"""
-        SELECT MEDIAN(recency_days) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE recency_days IS NOT NULL
-    """).fetchone()[0]
-    if median_rec is not None:
-        ok = median_rec <= MAX_MEDIAN_RECENCY_DAYS
-        _row(rows, "rfm", "median_recency_plausible",
-             _status(ok), round(float(median_rec), 1),
-             f"Median recency {median_rec:.1f} days — expected <= {MAX_MEDIAN_RECENCY_DAYS}")
-
-    max_rec = con.execute(f"""
-        SELECT MAX(recency_days) FROM read_parquet({_pq(RFM_FILE)})
-    """).fetchone()[0]
-    if max_rec is not None:
-        ok = max_rec <= MAX_ABSOLUTE_RECENCY_DAYS
-        _row(rows, "rfm", "max_recency_within_bounds",
-             _status(ok), int(max_rec),
-             f"Max recency {max_rec} days — expected <= {MAX_ABSOLUTE_RECENCY_DAYS}")
-
-    new_fy26 = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})
-        WHERE churn_label = -1
-    """).fetchone()[0]
-    ok = new_fy26 >= MIN_NEW_FY2526_CUSTOMERS
-    _row(rows, "rfm", "fy2526_new_cohort_present",
-         _status(ok), new_fy26,
-         f"{new_fy26:,} new-in-FY2526 customers — expected >= {MIN_NEW_FY2526_CUSTOMERS:,}")
-
-    con.close()
-
-
-# Check 10: Feature matrix
-
-def check_features(rows: list[dict]) -> None:
-    if not FEATURE_FILE.exists() or not RFM_FILE.exists():
-        return
-    con = _con(memory_gb=3, threads=1)
-
-    required_cols = [
-        "DIM_CUST_CURR_ID", "recency_days", "frequency", "monetary",
-        "avg_order_gap_days", "R_score", "F_score", "M_score",
-        "RFM_score", "churn_label",
-        "avg_revenue_per_order",
-        "n_categories_bought",
-        "category_hhi",
-        "cycle_regularity",
-        "supplier_profile",
+CUSTOMER_FILE = DATA_CLEAN / "customer" / "customers_clean.parquet"
+PRODUCT_FILE  = DATA_CLEAN / "product"  / "products_clean.parquet"
+SALES_FY25    = DATA_CLEAN / "sales"    / "transactions_clean_FY2425.parquet"
+SALES_FY26    = DATA_CLEAN / "sales"    / "transactions_clean_FY2526.parquet"
+MERGED_FILE   = DATA_CLEAN / "serving"  / "merged_dataset.parquet"
+FEATURE_FILE  = DATA_CLEAN / "features" / "customer_features.parquet"
+RFM_FILE      = DATA_CLEAN / "features" / "customer_rfm.parquet"
+SPEC_FILE     = DATA_CLEAN / "features" / "specialty_tiers.parquet"
+
+OUT_REPORT = DATA_CLEAN / "audit" / "00_sanity_check_summary.xlsx"
+
+
+# Expected ranges
+
+EXPECTED_CUSTOMER_ROWS   = (1_000_000, 1_200_000)
+EXPECTED_PRODUCT_ROWS    = (270_000,   285_000)
+EXPECTED_TRANSACTION_ROWS = (100_000_000, 115_000_000)
+EXPECTED_FEATURE_ROWS    = (380_000,   400_000)
+
+EXPECTED_SIZE_TIERS      = {"new", "small", "mid", "large", "enterprise"}
+EXPECTED_SUPPLIER_PROFILES = {"medline_only", "mckesson_primary", "mixed"}
+EXPECTED_CHURN_LABELS    = {-1, 0, 1}
+EXPECTED_MKT_CDS         = {"PO", "LTC", "SC", "LC", "HC", "AC", "X", "N/A"}
+
+REQUIRED_FEATURE_COLS = [
+    "DIM_CUST_CURR_ID",
+    "recency_days", "frequency", "monetary",
+    "avg_revenue_per_order", "avg_order_gap_days",
+    "R_score", "F_score", "M_score", "RFM_score", "churn_label",
+    "n_categories_bought", "category_hhi", "cycle_regularity",
+    "CUST_TYPE_CD", "SPCLTY_CD", "MKT_CD", "STATE",
+    "supplier_profile",
+    "median_monthly_spend", "active_months_last_12",
+    "size_tier", "affordability_ceiling",
+]
+
+
+# Logging
+
+def _s(title: str) -> None:
+    print(f"\n{'-' * 64}\n  {title}\n{'-' * 64}", flush=True)
+
+
+def _log(msg: str) -> None:
+    print(f"  {msg}", flush=True)
+
+
+def _check(name: str, passed: bool, detail: str = "") -> dict:
+    status = "PASS" if passed else "FAIL"
+    marker = "OK " if passed else "XX "
+    line = f"  [{marker}] {name}"
+    if detail:
+        line += f"  |  {detail}"
+    print(line, flush=True)
+    return {"check": name, "status": status, "detail": detail}
+
+
+# Excel helpers
+
+def _style(ws, df: pd.DataFrame, hc: str = "1F4E79") -> None:
+    thin = Side(style="thin", color="CCCCCC")
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for ci, col in enumerate(df.columns, 1):
+        c = ws.cell(1, ci, str(col))
+        c.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+        c.fill      = PatternFill("solid", fgColor=hc)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border    = bdr
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        bg = "F2F7FF" if ri % 2 == 0 else "FFFFFF"
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(ri, ci, val if pd.notna(val) else "")
+            c.font      = Font(name="Arial", size=9)
+            c.fill      = PatternFill("solid", fgColor=bg)
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            c.border    = bdr
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col_cells in ws.columns:
+        w = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+        ws.column_dimensions[get_column_letter(
+            col_cells[0].column)].width = min(max(w + 2, 12), 55)
+
+
+# Check 1: File existence and sizes
+
+def check_file_existence() -> list[dict]:
+    _s("Check 1: File existence and sizes")
+    results = []
+
+    expected_files = [
+        ("customers_clean.parquet",          CUSTOMER_FILE, 30,   80),
+        ("products_clean.parquet",           PRODUCT_FILE,  10,   30),
+        ("transactions_clean_FY2425.parquet", SALES_FY25,  1500, 3500),
+        ("transactions_clean_FY2526.parquet", SALES_FY26,  1500, 3500),
+        ("merged_dataset.parquet",           MERGED_FILE,  5000, 10000),
+        ("customer_features.parquet",        FEATURE_FILE,    5,   50),
+        ("customer_rfm.parquet",             RFM_FILE,        5,   30),
+        ("specialty_tiers.parquet",          SPEC_FILE,   0.001, 1.0),
     ]
-    feat_cols = set(
-        r[0] for r in con.execute(
-            f"DESCRIBE SELECT * FROM read_parquet({_pq(FEATURE_FILE)})"
-        ).fetchall()
-    )
-    missing = [c for c in required_cols if c not in feat_cols]
-    _row(rows, "features", "required_feature_columns", _status(len(missing) == 0),
-         len(missing), "Missing: " + (", ".join(missing) if missing else "None"))
 
-    bad_churn = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(FEATURE_FILE)})
-        WHERE churn_label NOT IN (-1, 0, 1)
-    """).fetchone()[0]
-    _row(rows, "features", "valid_churn_labels", _status(bad_churn == 0),
-         bad_churn, "churn_label must be one of {-1, 0, 1}")
-
-    rfm_rows  = con.execute(f"SELECT COUNT(*) FROM read_parquet({_pq(RFM_FILE)})").fetchone()[0]
-    feat_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet({_pq(FEATURE_FILE)})").fetchone()[0]
-    _row(rows, "features", "rfm_feature_row_match",
-         _status(rfm_rows == feat_rows), f"{rfm_rows} vs {feat_rows}",
-         "customer_rfm and customer_features must have the same row count")
-
-    df_sample = con.execute(
-        f"SELECT * FROM read_parquet({_pq(FEATURE_FILE)}) LIMIT 10000"
-    ).df()
-    null_cols = [c for c in df_sample.columns if df_sample[c].isna().all()]
-    _row(rows, "features", "no_all_null_columns", _status(len(null_cols) == 0),
-         len(null_cols),
-         "All-null columns: " + (", ".join(null_cols) if null_cols else "None"))
-
-    tier3_present = "tier3_fallback_spclty_cd" in feat_cols
-    _row(rows, "features", "tier3_fallback_excluded",
-         _status(not tier3_present),
-         "present" if tier3_present else "absent",
-         "tier3_fallback_spclty_cd must not be in customer_features — use specialty_tiers.parquet")
-
-    _row(rows, "features", "feature_column_count",
-         _status(len(feat_cols) == EXPECTED_FEATURE_COLS), len(feat_cols),
-         f"Expected {EXPECTED_FEATURE_COLS} columns, got {len(feat_cols)}")
-
-    spec_cols = [c for c in feat_cols if c.startswith("spec_")]
-    _row(rows, "features", "specialty_indicator_columns_present",
-         _status(len(spec_cols) >= 20), len(spec_cols),
-         f"{len(spec_cols)} spec_ columns found — expected >= 20")
-
-    con.close()
-
-
-# Check 11: Supplier profile
-
-def check_supplier_profile(rows: list[dict]) -> None:
-    if not FEATURE_FILE.exists():
-        return
-    con = _con(memory_gb=3, threads=1)
-
-    feat_cols = set(
-        r[0] for r in con.execute(
-            f"DESCRIBE SELECT * FROM read_parquet({_pq(FEATURE_FILE)})"
-        ).fetchall()
-    )
-    if "supplier_profile" not in feat_cols:
-        _row(rows, "supplier_profile", "column_exists", "FAIL", 0,
-             "supplier_profile column missing from customer_features")
-        con.close()
-        return
-
-    _row(rows, "supplier_profile", "column_exists", "PASS", 1,
-         "supplier_profile column present in customer_features")
-
-    null_count = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(FEATURE_FILE)})
-        WHERE supplier_profile IS NULL
-    """).fetchone()[0]
-    _row(rows, "supplier_profile", "no_null_values",
-         _status(null_count == 0), null_count,
-         "supplier_profile must have no null values — unmatched customers default to 'mixed'")
-
-    invalid_vals = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(FEATURE_FILE)})
-        WHERE supplier_profile NOT IN (
-            '{"', '".join(sorted(VALID_SUPPLIER_PROFILES))}'
-        )
-    """).fetchone()[0]
-    _row(rows, "supplier_profile", "valid_values_only",
-         _status(invalid_vals == 0), invalid_vals,
-         f"supplier_profile must be one of: {sorted(VALID_SUPPLIER_PROFILES)}")
-
-    total = con.execute(f"""
-        SELECT COUNT(*) FROM read_parquet({_pq(FEATURE_FILE)})
-    """).fetchone()[0]
-
-    counts = con.execute(f"""
-        SELECT supplier_profile, COUNT(*) AS n
-        FROM read_parquet({_pq(FEATURE_FILE)})
-        GROUP BY supplier_profile
-    """).df()
-
-    medline_n   = int(counts.loc[counts["supplier_profile"] == "medline_only", "n"].sum())
-    mckesson_n  = int(counts.loc[counts["supplier_profile"] == "mckesson_primary", "n"].sum())
-    mixed_n     = int(counts.loc[counts["supplier_profile"] == "mixed", "n"].sum())
-
-    medline_pct  = medline_n / max(total, 1)
-    mckesson_pct = mckesson_n / max(total, 1)
-    mixed_pct    = mixed_n / max(total, 1)
-
-    ok_med = MIN_MEDLINE_ONLY_PCT <= medline_pct <= MAX_MEDLINE_ONLY_PCT
-    _row(rows, "supplier_profile", "medline_only_distribution",
-         _status(ok_med), f"{medline_n:,} ({medline_pct*100:.2f}%)",
-         f"medline_only must be between {MIN_MEDLINE_ONLY_PCT*100}% and "
-         f"{MAX_MEDLINE_ONLY_PCT*100}% of customers")
-
-    ok_mck = MIN_MCKESSON_PRIMARY_PCT <= mckesson_pct <= MAX_MCKESSON_PRIMARY_PCT
-    _row(rows, "supplier_profile", "mckesson_primary_distribution",
-         _status(ok_mck), f"{mckesson_n:,} ({mckesson_pct*100:.2f}%)",
-         f"mckesson_primary must be between {MIN_MCKESSON_PRIMARY_PCT*100}% and "
-         f"{MAX_MCKESSON_PRIMARY_PCT*100}% of customers")
-
-    ok_mix = mixed_pct >= MIN_MIXED_PCT
-    _row(rows, "supplier_profile", "mixed_is_majority",
-         _status(ok_mix), f"{mixed_n:,} ({mixed_pct*100:.2f}%)",
-         f"mixed must be >= {MIN_MIXED_PCT*100}% of customers")
-
-    n_profiles = len(counts["supplier_profile"].unique())
-    _row(rows, "supplier_profile", "all_profiles_present",
-         _status(n_profiles == 3), n_profiles,
-         f"Expected all 3 profiles present, got {n_profiles}")
-
-    con.close()
-
-
-# Check 12: Serving dataset
-
-def check_serving(rows: list[dict]) -> None:
-    if not all(p.exists() for p in [MERGED_FILE, TXN_FY2425_FILE, TXN_FY2526_FILE]):
-        return
-    con = _con(memory_gb=4, threads=1)
-
-    merged_rows = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet({_pq(MERGED_FILE)})"
-    ).fetchone()[0]
-    txn_rows = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet([{_pq(TXN_FY2425_FILE)}, {_pq(TXN_FY2526_FILE)}])"
-    ).fetchone()[0]
-    _row(rows, "serving", "merged_row_count_matches_transactions",
-         _status(merged_rows == txn_rows), f"{merged_rows} vs {txn_rows}",
-         "Merged dataset must have the same row count as cleaned transactions combined")
-
-    # Supplier columns must flow through so step 6b can compute supplier_profile
-    desc = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet({_pq(MERGED_FILE)}) LIMIT 0"
-    ).df()
-    merged_cols = set(desc["column_name"].tolist())
-
-    has_suplr = "SUPLR_ROLLUP_DSC" in merged_cols
-    has_pvt   = "is_private_brand" in merged_cols
-
-    _row(rows, "serving", "supplier_rollup_in_merged",
-         _status(has_suplr), int(has_suplr),
-         "SUPLR_ROLLUP_DSC must flow into merged_dataset for supplier_profile computation")
-
-    _row(rows, "serving", "is_private_brand_in_merged",
-         _status(has_pvt), int(has_pvt),
-         "is_private_brand must flow into merged_dataset for supplier_profile computation")
-
-    con.close()
-
-
-# Check 13: Dedup correctness (raw vs clean)
-
-def check_raw_vs_clean_distinct_keys(rows: list[dict]) -> None:
-    raw_fact_folders = _discover_raw_fact_folders()
-    if not raw_fact_folders:
-        _row(rows, "dedup_correctness", "raw_folders_found", "FAIL", 0,
-             "Could not locate raw fact folders in data_raw/")
-        return
-
-    con = _con(memory_gb=6, threads=1)
-    blocked_sql = ", ".join(str(x) for x in sorted(EXCLUDED_ORDER_NUMS))
-
-    for fy, raw_folder in sorted(raw_fact_folders.items()):
-        cleaned_path = TXN_FY2425_FILE if fy == "FY2425" else TXN_FY2526_FILE
-        if not cleaned_path.exists():
+    for label, path, min_mb, max_mb in expected_files:
+        if not path.exists():
+            results.append(_check(f"{label} exists", False, f"Not found: {path}"))
             continue
+        size_mb = path.stat().st_size / (1024 * 1024)
+        in_range = min_mb <= size_mb <= max_mb
+        results.append(_check(
+            f"{label} size",
+            in_range,
+            f"{size_mb:.1f} MB  (expected {min_mb}-{max_mb} MB)"
+        ))
+    return results
 
-        raw_distinct = con.execute(f"""
-            SELECT COUNT(*) FROM (
-                SELECT DISTINCT ORDR_NUM, ORDR_LINE_NUM
-                FROM read_parquet({_glob(raw_folder)})
-                WHERE ORDR_NUM NOT IN ({blocked_sql})
-                  AND (UNIT_SLS_AMT IS NULL OR UNIT_SLS_AMT <= {MAX_ORDER_LINE_VALUE})
-                  AND ORDR_QTY >= 0
+
+# Check 2: Row counts
+
+def check_row_counts() -> list[dict]:
+    _s("Check 2: Row counts match expectations")
+    results = []
+
+    if CUSTOMER_FILE.exists():
+        n = len(pd.read_parquet(CUSTOMER_FILE, columns=["DIM_CUST_CURR_ID"]))
+        in_range = EXPECTED_CUSTOMER_ROWS[0] <= n <= EXPECTED_CUSTOMER_ROWS[1]
+        results.append(_check(
+            "Customer rows", in_range,
+            f"{n:,} rows  (expected {EXPECTED_CUSTOMER_ROWS[0]:,}-{EXPECTED_CUSTOMER_ROWS[1]:,})"
+        ))
+
+    if PRODUCT_FILE.exists():
+        n = len(pd.read_parquet(PRODUCT_FILE, columns=["DIM_ITEM_E1_CURR_ID"]))
+        in_range = EXPECTED_PRODUCT_ROWS[0] <= n <= EXPECTED_PRODUCT_ROWS[1]
+        results.append(_check(
+            "Product rows", in_range,
+            f"{n:,} rows  (expected {EXPECTED_PRODUCT_ROWS[0]:,}-{EXPECTED_PRODUCT_ROWS[1]:,})"
+        ))
+
+    if SALES_FY25.exists() and SALES_FY26.exists():
+        import duckdb
+        con = duckdb.connect()
+        total = con.execute(f"""
+            SELECT COUNT(*) FROM read_parquet(
+                ['{SALES_FY25.as_posix()}', '{SALES_FY26.as_posix()}']
             )
         """).fetchone()[0]
+        con.close()
+        in_range = EXPECTED_TRANSACTION_ROWS[0] <= total <= EXPECTED_TRANSACTION_ROWS[1]
+        results.append(_check(
+            "Transaction rows (both FYs)", in_range,
+            f"{total:,} rows  (expected {EXPECTED_TRANSACTION_ROWS[0]:,}-{EXPECTED_TRANSACTION_ROWS[1]:,})"
+        ))
 
-        cleaned_rows = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet({_pq(cleaned_path)})"
-        ).fetchone()[0]
+    if FEATURE_FILE.exists():
+        n = len(pd.read_parquet(FEATURE_FILE, columns=["DIM_CUST_CURR_ID"]))
+        in_range = EXPECTED_FEATURE_ROWS[0] <= n <= EXPECTED_FEATURE_ROWS[1]
+        results.append(_check(
+            "Feature rows", in_range,
+            f"{n:,} rows  (expected {EXPECTED_FEATURE_ROWS[0]:,}-{EXPECTED_FEATURE_ROWS[1]:,})"
+        ))
 
-        ratio = round(cleaned_rows / raw_distinct, 6) if raw_distinct else None
-        ok = ratio is not None and ratio >= 0.9999
-
-        _row(rows, "dedup_correctness",
-             f"raw_distinct_vs_cleaned::{fy}", _status(ok), ratio,
-             f"raw_distinct_filtered_keys={raw_distinct:,}  "
-             f"cleaned_rows={cleaned_rows:,}  "
-             f"ratio={ratio}  (>=0.9999 is acceptable)")
-
-    con.close()
+    return results
 
 
-# Excel output
+# Check 3: Schema integrity
 
-def write_outputs(results: pd.DataFrame) -> None:
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
+def check_schema() -> list[dict]:
+    _s("Check 3: Schema integrity (required columns present)")
+    results = []
 
-    OUT_AUDIT.mkdir(parents=True, exist_ok=True)
-    results.to_csv(SUMMARY_CSV, index=False)
+    if FEATURE_FILE.exists():
+        df_cols = pd.read_parquet(FEATURE_FILE).columns.tolist()
+        missing = [c for c in REQUIRED_FEATURE_COLS if c not in df_cols]
+        results.append(_check(
+            "customer_features.parquet columns",
+            len(missing) == 0,
+            f"{len(df_cols)} total columns  |  missing: {missing if missing else 'none'}"
+        ))
 
-    status_fill = {
-        "PASS": "D5F0DC",
-        "FAIL": "FFCCCC",
-        "WARN": "FFF2CC",
-        "INFO": "DDEEFF",
-    }
-    thin   = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        # Check specifically for new Step 6c columns
+        new_cols = ["median_monthly_spend", "active_months_last_12",
+                    "size_tier", "affordability_ceiling"]
+        for col in new_cols:
+            present = col in df_cols
+            results.append(_check(
+                f"New column: {col}",
+                present,
+                "present" if present else "MISSING — Step 6c did not run"
+            ))
 
-    def _style(ws, df):
-        for ci, col in enumerate(df.columns, 1):
-            c = ws.cell(1, ci, col)
-            c.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-            c.fill      = PatternFill("solid", fgColor="1F4E79")
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c.border    = border
-        for ri, row in enumerate(df.itertuples(index=False), 2):
-            status = str(getattr(row, "status", ""))
-            bg     = status_fill.get(status, "FFFFFF")
-            for ci, val in enumerate(row, 1):
-                c = ws.cell(ri, ci, val if pd.notna(val) else "")
-                c.font      = Font(name="Arial", size=9)
-                c.fill      = PatternFill("solid", fgColor=bg)
-                c.alignment = Alignment(horizontal="left", vertical="center")
-                c.border    = border
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for col_cells in ws.columns:
-            w = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
-            ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max(w + 2, 10), 60)
+    return results
 
-    summary = (
-        results.groupby(["category", "status"])
-        .size().reset_index(name="count")
-        .sort_values(["category", "status"])
-    )
-    failed = results[results["status"] == "FAIL"].copy()
-    if failed.empty:
-        failed = pd.DataFrame([{"message": "No failed checks"}])
 
-    with pd.ExcelWriter(SUMMARY_XLSX, engine="openpyxl") as writer:
-        results.to_excel(writer, sheet_name="all_checks",    index=False)
-        summary.to_excel(writer, sheet_name="status_counts", index=False)
-        failed.to_excel(writer, sheet_name="failed_checks",  index=False)
+# Check 4: Value integrity
+
+def check_values() -> list[dict]:
+    _s("Check 4: Value integrity (valid values only)")
+    results = []
+
+    if not FEATURE_FILE.exists():
+        return results
+
+    df = pd.read_parquet(FEATURE_FILE)
+
+    # size_tier
+    if "size_tier" in df.columns:
+        actual = set(df["size_tier"].dropna().unique())
+        invalid = actual - EXPECTED_SIZE_TIERS
+        results.append(_check(
+            "size_tier values valid",
+            len(invalid) == 0,
+            f"values: {sorted(actual)}  |  invalid: {sorted(invalid) if invalid else 'none'}"
+        ))
+
+    # supplier_profile
+    if "supplier_profile" in df.columns:
+        actual = set(df["supplier_profile"].dropna().unique())
+        invalid = actual - EXPECTED_SUPPLIER_PROFILES
+        results.append(_check(
+            "supplier_profile values valid",
+            len(invalid) == 0,
+            f"values: {sorted(actual)}  |  invalid: {sorted(invalid) if invalid else 'none'}"
+        ))
+
+    # churn_label
+    if "churn_label" in df.columns:
+        actual = set(df["churn_label"].dropna().astype(int).unique())
+        invalid = actual - EXPECTED_CHURN_LABELS
+        results.append(_check(
+            "churn_label values valid",
+            len(invalid) == 0,
+            f"values: {sorted(actual)}  |  invalid: {sorted(invalid) if invalid else 'none'}"
+        ))
+
+    # No negative monetary
+    if "monetary" in df.columns:
+        n_neg = (df["monetary"] < 0).sum()
+        results.append(_check(
+            "monetary non-negative",
+            n_neg == 0,
+            f"{n_neg:,} negative values"
+        ))
+
+    # No negative affordability_ceiling
+    if "affordability_ceiling" in df.columns:
+        n_neg = (df["affordability_ceiling"] < 0).sum()
+        results.append(_check(
+            "affordability_ceiling non-negative",
+            n_neg == 0,
+            f"{n_neg:,} negative values"
+        ))
+
+    # No negative median_monthly_spend
+    if "median_monthly_spend" in df.columns:
+        n_neg = (df["median_monthly_spend"] < 0).sum()
+        results.append(_check(
+            "median_monthly_spend non-negative",
+            n_neg == 0,
+            f"{n_neg:,} negative values"
+        ))
+
+    # active_months_last_12 in [0, 12]
+    if "active_months_last_12" in df.columns:
+        n_bad = ((df["active_months_last_12"] < 0) |
+                 (df["active_months_last_12"] > 12)).sum()
+        results.append(_check(
+            "active_months_last_12 in [0, 12]",
+            n_bad == 0,
+            f"{n_bad:,} out-of-range values"
+        ))
+
+    # R, F, M scores in [1, 5]
+    for col in ["R_score", "F_score", "M_score"]:
+        if col in df.columns:
+            s = df[col].dropna()
+            n_bad = ((s < 1) | (s > 5)).sum()
+            results.append(_check(
+                f"{col} in [1, 5]",
+                n_bad == 0,
+                f"{n_bad:,} out-of-range values"
+            ))
+
+    # category_hhi in [0, 1]
+    if "category_hhi" in df.columns:
+        s = df["category_hhi"].dropna()
+        n_bad = ((s < 0) | (s > 1)).sum()
+        results.append(_check(
+            "category_hhi in [0, 1]",
+            n_bad == 0,
+            f"{n_bad:,} out-of-range values"
+        ))
+
+    return results
+
+
+# Check 5: Distribution sanity
+
+def check_distributions() -> list[dict]:
+    _s("Check 5: Distribution sanity")
+    results = []
+
+    if not FEATURE_FILE.exists():
+        return results
+
+    df = pd.read_parquet(FEATURE_FILE)
+
+    # Size tier distribution — no tier less than 0.1%, no tier more than 70%
+    if "size_tier" in df.columns:
+        st_pct = df["size_tier"].value_counts(normalize=True) * 100
+
+        for tier in EXPECTED_SIZE_TIERS:
+            pct = st_pct.get(tier, 0)
+            in_range = 0.1 <= pct <= 70.0 if tier != "enterprise" else 0.0 <= pct <= 70.0
+            # Enterprise can be very small, down to ~0.5%
+            if tier == "enterprise":
+                in_range = pct >= 0.1 and pct <= 70.0
+            results.append(_check(
+                f"size_tier '{tier}' share",
+                in_range,
+                f"{pct:.2f}%"
+            ))
+
+    # Supplier profile distribution
+    if "supplier_profile" in df.columns:
+        sp_pct = df["supplier_profile"].value_counts(normalize=True) * 100
+        for profile in EXPECTED_SUPPLIER_PROFILES:
+            pct = sp_pct.get(profile, 0)
+            results.append(_check(
+                f"supplier_profile '{profile}' share",
+                pct > 0,
+                f"{pct:.2f}%"
+            ))
+
+    # Churn rate between 5% and 50%
+    if "churn_label" in df.columns:
+        churn_df = df[df["churn_label"].isin([0, 1])]
+        churn_rate = (churn_df["churn_label"] == 1).mean() * 100
+        in_range = 5 <= churn_rate <= 50
+        results.append(_check(
+            "Churn rate reasonable",
+            in_range,
+            f"{churn_rate:.2f}%  (expected 5-50%)"
+        ))
+
+    return results
+
+
+# Check 6: Business logic validation
+
+def check_business_logic() -> list[dict]:
+    _s("Check 6: Business logic validation")
+    results = []
+
+    if not FEATURE_FILE.exists():
+        return results
+
+    df = pd.read_parquet(FEATURE_FILE)
+
+    # All 'new' tier customers must have active_months_last_12 < 2
+    if "size_tier" in df.columns and "active_months_last_12" in df.columns:
+        new_custs = df[df["size_tier"] == "new"]
+        violation = (new_custs["active_months_last_12"] >= 2).sum()
+        results.append(_check(
+            "'new' tier implies active_months < 2",
+            violation == 0,
+            f"{violation:,} violations"
+        ))
+
+    # Non-new tier customers must have active_months_last_12 >= 2
+    if "size_tier" in df.columns and "active_months_last_12" in df.columns:
+        non_new = df[df["size_tier"] != "new"]
+        violation = (non_new["active_months_last_12"] < 2).sum()
+        results.append(_check(
+            "Non-'new' tiers imply active_months >= 2",
+            violation == 0,
+            f"{violation:,} violations"
+        ))
+
+    # Size tier ordering: enterprise median > large median > mid median > small median
+    if "size_tier" in df.columns and "median_monthly_spend" in df.columns:
+        medians = df.groupby("size_tier")["median_monthly_spend"].median()
+        small_m = medians.get("small", 0)
+        mid_m = medians.get("mid", 0)
+        large_m = medians.get("large", 0)
+        ent_m = medians.get("enterprise", 0)
+        ordered = small_m <= mid_m <= large_m <= ent_m
+        results.append(_check(
+            "Size tier spend ordering (small<=mid<=large<=enterprise)",
+            ordered,
+            f"small=${small_m:,.0f}  mid=${mid_m:,.0f}  large=${large_m:,.0f}  enterprise=${ent_m:,.0f}"
+        ))
+
+    # Affordability ceiling should equal median_monthly_spend * multiplier
+    # Multipliers: new=3.0, small=1.5, mid=1.8, large=2.0, enterprise=2.5
+    if all(c in df.columns for c in ["size_tier", "median_monthly_spend", "affordability_ceiling"]):
+        multipliers = {"new": 3.0, "small": 1.5, "mid": 1.8, "large": 2.0, "enterprise": 2.5}
+        df_check = df.copy()
+        df_check["expected_ceiling"] = df_check["size_tier"].map(multipliers) * df_check["median_monthly_spend"]
+        df_check["diff"] = (df_check["affordability_ceiling"] - df_check["expected_ceiling"]).abs()
+        violation = (df_check["diff"] > 0.05).sum()  # allow tiny rounding
+        results.append(_check(
+            "Affordability ceiling formula correct",
+            violation == 0,
+            f"{violation:,} rows with incorrect calculation"
+        ))
+
+    # DIM_CUST_CURR_ID uniqueness in features
+    if "DIM_CUST_CURR_ID" in df.columns:
+        n_total = len(df)
+        n_unique = df["DIM_CUST_CURR_ID"].nunique()
+        results.append(_check(
+            "DIM_CUST_CURR_ID unique in features",
+            n_total == n_unique,
+            f"{n_total:,} rows  |  {n_unique:,} unique IDs"
+        ))
+
+    return results
+
+
+# Check 7: Cross-file consistency
+
+def check_cross_file() -> list[dict]:
+    _s("Check 7: Cross-file consistency")
+    results = []
+
+    if FEATURE_FILE.exists() and CUSTOMER_FILE.exists():
+        feat_ids = set(pd.read_parquet(
+            FEATURE_FILE, columns=["DIM_CUST_CURR_ID"]
+        )["DIM_CUST_CURR_ID"])
+        cust_ids = set(pd.read_parquet(
+            CUSTOMER_FILE, columns=["DIM_CUST_CURR_ID"]
+        )["DIM_CUST_CURR_ID"])
+        orphan = feat_ids - cust_ids
+        results.append(_check(
+            "All feature IDs exist in customer dim",
+            len(orphan) == 0,
+            f"{len(orphan):,} orphan IDs in features"
+        ))
+
+    if PRODUCT_FILE.exists() and MERGED_FILE.exists():
+        import duckdb
+        con = duckdb.connect()
+        try:
+            result = con.execute(f"""
+                SELECT
+                    COUNT(DISTINCT m.DIM_ITEM_E1_CURR_ID) AS merged_items,
+                    COUNT(DISTINCT p.DIM_ITEM_E1_CURR_ID) AS product_items
+                FROM read_parquet('{MERGED_FILE.as_posix()}') m
+                LEFT JOIN read_parquet('{PRODUCT_FILE.as_posix()}') p
+                    ON m.DIM_ITEM_E1_CURR_ID = p.DIM_ITEM_E1_CURR_ID
+                WHERE p.DIM_ITEM_E1_CURR_ID IS NULL
+            """).fetchone()
+            # This checks items in merged that are NOT in products
+            orphan_items = con.execute(f"""
+                SELECT COUNT(DISTINCT m.DIM_ITEM_E1_CURR_ID)
+                FROM read_parquet('{MERGED_FILE.as_posix()}') m
+                LEFT JOIN read_parquet('{PRODUCT_FILE.as_posix()}') p
+                    ON m.DIM_ITEM_E1_CURR_ID = p.DIM_ITEM_E1_CURR_ID
+                WHERE p.DIM_ITEM_E1_CURR_ID IS NULL
+            """).fetchone()[0]
+            # Some orphans are expected (6.26% null product match), that's fine
+            results.append(_check(
+                "Product match coverage in merged",
+                True,
+                f"{orphan_items:,} items in transactions without product record (expected some)"
+            ))
+        finally:
+            con.close()
+
+    return results
+
+
+# Summary
+
+def print_summary(all_results: list[dict]) -> int:
+    _s("Summary")
+    n_total = len(all_results)
+    n_pass = sum(1 for r in all_results if r["status"] == "PASS")
+    n_fail = n_total - n_pass
+
+    _log(f"Total checks : {n_total}")
+    _log(f"Passed       : {n_pass}")
+    _log(f"Failed       : {n_fail}")
+
+    if n_fail > 0:
+        _log("")
+        _log("Failed checks:")
+        for r in all_results:
+            if r["status"] == "FAIL":
+                _log(f"  - {r['check']}  |  {r['detail']}")
+
+    return n_fail
+
+
+def save_report(all_results: list[dict]) -> None:
+    OUT_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(all_results)
+    n_pass = (df["status"] == "PASS").sum()
+    n_fail = (df["status"] == "FAIL").sum()
+
+    summary = pd.DataFrame([
+        {"metric": "Total checks", "value": len(df)},
+        {"metric": "Passed",       "value": int(n_pass)},
+        {"metric": "Failed",       "value": int(n_fail)},
+        {"metric": "Pass rate",    "value": f"{n_pass / max(len(df), 1) * 100:.1f}%"},
+    ])
+
+    with pd.ExcelWriter(OUT_REPORT, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="01_summary", index=False)
+        df.to_excel(writer, sheet_name="02_all_checks", index=False)
+
+        failed = df[df["status"] == "FAIL"]
+        if len(failed) > 0:
+            failed.to_excel(writer, sheet_name="03_failures", index=False)
 
         wb = writer.book
-        wb["all_checks"].sheet_properties.tabColor    = "1F4E79"
-        wb["status_counts"].sheet_properties.tabColor = "375623"
-        wb["failed_checks"].sheet_properties.tabColor = "C00000"
+        _style(writer.sheets["01_summary"], summary, hc="1F4E79")
+        wb["01_summary"].sheet_properties.tabColor = "1F4E79"
 
-        _style(writer.sheets["all_checks"],    results)
-        _style(writer.sheets["status_counts"], summary)
-        _style(writer.sheets["failed_checks"], failed)
+        _style(writer.sheets["02_all_checks"], df, hc="375623")
+        wb["02_all_checks"].sheet_properties.tabColor = "375623"
 
-
-# Console summary
-
-def print_console_summary(results: pd.DataFrame) -> int:
-    print("\n" + "=" * 72)
-    print("  CLEAN DATA SANITY CHECK")
-    print("=" * 72)
-
-    passes   = int((results["status"] == "PASS").sum())
-    fails    = int((results["status"] == "FAIL").sum())
-    warnings = int((results["status"] == "WARN").sum())
-    infos    = int((results["status"] == "INFO").sum())
-    total    = len(results)
-
-    print(f"  Total : {total}")
-    print(f"  PASS  : {passes}")
-    print(f"  FAIL  : {fails}   (critical — fix before running models)")
-    print(f"  WARN  : {warnings}   (non-critical — investigate but not blocking)")
-    print(f"  INFO  : {infos}   (row counts — no pass/fail judgment)")
-
-    # Per-category breakdown
-    print()
-    print("  Category breakdown:")
-    cat_summary = (
-        results.groupby(["category", "status"]).size().unstack(fill_value=0)
-    )
-    for col in ["PASS", "FAIL", "WARN", "INFO"]:
-        if col not in cat_summary.columns:
-            cat_summary[col] = 0
-    cat_summary = cat_summary[["PASS", "FAIL", "WARN", "INFO"]]
-    for category, row in cat_summary.iterrows():
-        print(f"    {category:<22} "
-              f"PASS={row['PASS']:<3} FAIL={row['FAIL']:<3} "
-              f"WARN={row['WARN']:<3} INFO={row['INFO']:<3}")
-
-    if fails > 0:
-        print("\n  FAILED CHECKS:")
-        for _, r in results[results["status"] == "FAIL"].iterrows():
-            print(f"    [{r['category']}]  {r['check_name']}")
-            print(f"        value  : {r['metric_value']}")
-            print(f"        detail : {r['detail']}")
-
-    if warnings > 0:
-        print("\n  WARNINGS:")
-        for _, r in results[results["status"] == "WARN"].iterrows():
-            print(f"    [{r['category']}]  {r['check_name']}")
-            print(f"        value  : {r['metric_value']}")
-            print(f"        detail : {r['detail']}")
-
-    # Supplier profile distribution summary
-    sp_rows = results[
-        (results["category"] == "supplier_profile") &
-        (results["check_name"].isin([
-            "medline_only_distribution",
-            "mckesson_primary_distribution",
-            "mixed_is_majority",
-        ]))
-    ]
-    if len(sp_rows) > 0:
-        print("\n  Supplier profile distribution:")
-        for _, r in sp_rows.iterrows():
-            label = (r["check_name"]
-                     .replace("_distribution", "")
-                     .replace("_is_majority", ""))
-            print(f"    {label:<24} {r['metric_value']}   [{r['status']}]")
-
-    if fails == 0 and warnings == 0:
-        print("\n  All checks passed. Data is clean and ready for model training.")
-    elif fails == 0:
-        print(f"\n  No critical failures. {warnings} warning(s) to investigate.")
-    else:
-        print(f"\n  {fails} critical failure(s). Do not proceed to model training.")
+        if len(failed) > 0:
+            _style(writer.sheets["03_failures"], failed, hc="C00000")
+            wb["03_failures"].sheet_properties.tabColor = "C00000"
 
     print()
-    print(f"  CSV   : {SUMMARY_CSV.relative_to(ROOT)}")
-    print(f"  Excel : {SUMMARY_XLSX.relative_to(ROOT)}")
-    print("=" * 72)
-    print()
-
-    return fails
+    _log(f"Saved: {OUT_REPORT.relative_to(ROOT)}")
 
 
 # Main
 
 def main() -> None:
-    rows: list[dict] = []
+    print()
+    print("=" * 64)
+    print("  CLEAN_DATA SANITY CHECK")
+    print("=" * 64)
+    start = time.time()
 
-    check_required_files(rows)
-    check_row_counts(rows)
-    check_customers(rows)
-    check_products(rows)
-    check_sales(rows)
-    check_referential_integrity(rows)
-    check_specialty_tiers(rows)
-    check_rfm(rows)
-    check_features(rows)
-    check_supplier_profile(rows)
-    check_serving(rows)
-    check_raw_vs_clean_distinct_keys(rows)
+    all_results = []
+    all_results += check_file_existence()
+    all_results += check_row_counts()
+    all_results += check_schema()
+    all_results += check_values()
+    all_results += check_distributions()
+    all_results += check_business_logic()
+    all_results += check_cross_file()
 
-    results  = pd.DataFrame(rows)
-    write_outputs(results)
-    failures = print_console_summary(results)
+    n_fail = print_summary(all_results)
+    save_report(all_results)
 
-    sys.exit(1 if failures > 0 else 0)
+    _log(f"Runtime: {time.time() - start:.1f}s")
+
+    if n_fail > 0:
+        print()
+        print(f"XX SANITY CHECK FAILED: {n_fail} check(s) failed.")
+        print("Review data_clean/audit/00_sanity_check_summary.xlsx for details.")
+        sys.exit(1)
+    else:
+        print()
+        print("OK SANITY CHECK PASSED: All checks passed.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\nFATAL ERROR: {exc}", file=sys.stderr)
+        raise

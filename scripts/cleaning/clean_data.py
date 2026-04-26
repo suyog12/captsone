@@ -43,14 +43,26 @@ TIER2_MIN_CUSTOMERS: int = 10
 STATE_MIN_CUSTOMERS: int = 500
 
 # Supplier profile thresholds
-# Used in step6b to tag each customer with their supplier buying pattern.
-# Thresholds validated against real data:
-#   medline_only      ~0.1% of customers (377 of 389k)  — avg 78% Medline share
-#   mckesson_primary  ~16%  of customers (63k of 389k)  — avg 72% private brand share
-#   mixed             ~84%  of customers — everything else
 MEDLINE_SUPPLIER_NAME: str = "MEDLINE INDUSTRIES"
 MEDLINE_THRESHOLD: float = 0.50
 MCKESSON_PRIVATE_THRESHOLD: float = 0.50
+
+# Size tier thresholds (median monthly spend in dollars)
+SIZE_TIER_SMALL_MAX  = 500
+SIZE_TIER_MID_MAX    = 2_500
+SIZE_TIER_LARGE_MAX  = 15_000
+
+# New customer definition
+MIN_ACTIVE_MONTHS_FOR_TIER = 2
+
+# Affordability ceiling multipliers by size tier
+AFFORDABILITY_MULTIPLIER = {
+    "new":        3.0,
+    "small":      1.5,
+    "mid":        1.8,
+    "large":      2.0,
+    "enterprise": 2.5,
+}
 
 _DROP_NULL_CUSTOMER: list[str] = [
     "BID_NUM", "CCS_CD", "CCS_DSC", "CCS_DT",
@@ -932,16 +944,6 @@ def step6b_patch_category_features(
     features: pd.DataFrame,
     merged_path: Path,
 ) -> pd.DataFrame:
-    # Patches n_categories_bought and category_hhi in the feature matrix
-    # using the merged serving dataset which has PROD_FMLY_LVL1_DSC available.
-    #
-    # Also computes supplier_profile — a per-customer tag that classifies each
-    # customer by their supplier buying pattern. This drives the recommendation
-    # framing in the backend:
-    #   medline_only      customer spends >= 50% on Medline products
-    #   mckesson_primary  customer spends >= 50% on McKesson private brand products
-    #   mixed             everyone else (majority bucket, standard recommendations)
-
     _section("Step 6b: Patching category features and computing supplier profile")
 
     if not merged_path.exists():
@@ -950,7 +952,6 @@ def step6b_patch_category_features(
 
     con = _con(memory_gb=5, threads=2)
 
-    # Detect product family column in the merged dataset
     desc = con.execute(
         f"DESCRIBE SELECT * FROM read_parquet('{merged_path.as_posix()}') LIMIT 0"
     ).df()
@@ -966,7 +967,6 @@ def step6b_patch_category_features(
     else:
         _log(f"Product family column in merged_dataset: {family_col}")
 
-        # n_categories_bought — distinct product families per customer
         n_cats = con.execute(f"""
             SELECT
                 CAST(DIM_CUST_CURR_ID AS BIGINT)             AS cust_id,
@@ -980,7 +980,6 @@ def step6b_patch_category_features(
         _log(f"  median: {n_cats['n_categories_bought'].median():.1f}  "
              f"max: {n_cats['n_categories_bought'].max()}")
 
-        # category_hhi — spend concentration
         family_spend = con.execute(f"""
             SELECT
                 CAST(DIM_CUST_CURR_ID AS BIGINT)            AS cust_id,
@@ -1010,7 +1009,6 @@ def step6b_patch_category_features(
         _log(f"  median: {hhi['category_hhi'].median():.3f}  "
              f"mean: {hhi['category_hhi'].mean():.3f}")
 
-        # Patch into feature matrix
         features = features.copy()
         features["DIM_CUST_CURR_ID_int"] = features["DIM_CUST_CURR_ID"].astype("Int64")
 
@@ -1046,10 +1044,6 @@ def step6b_patch_category_features(
              f"after: {features['n_categories_bought'].median():.1f}")
         _log(f"category_hhi         before patch median: {before_hhi:.3f}  "
              f"after: {features['category_hhi'].median():.3f}")
-
-    # Supplier profile computation
-    # Requires SUPLR_ROLLUP_DSC and is_private_brand in merged_dataset.
-    # Those come from the product dimension join in step8.
 
     _log("")
     _log("Computing supplier_profile tag from merged dataset...")
@@ -1109,7 +1103,6 @@ def step6b_patch_category_features(
         pct = round(count / len(supplier_spend) * 100, 2) if len(supplier_spend) else 0
         _log(f"  {profile_name:<20} {count:>8,} customers  ({pct}%)")
 
-    # Merge supplier_profile into features
     if "DIM_CUST_CURR_ID_int" not in features.columns:
         features = features.copy()
         features["DIM_CUST_CURR_ID_int"] = features["DIM_CUST_CURR_ID"].astype("Int64")
@@ -1123,7 +1116,6 @@ def step6b_patch_category_features(
         on="DIM_CUST_CURR_ID_int", how="left"
     )
 
-    # Customers not in merged_dataset get 'mixed' as safe default
     features["supplier_profile"] = features["supplier_profile"].fillna("mixed")
 
     n_unmatched = int((features["supplier_profile"] == "mixed").sum() -
@@ -1137,6 +1129,156 @@ def step6b_patch_category_features(
     out = OUT_FEATURES / "customer_features.parquet"
     features.to_parquet(out, index=False)
     _log(f"Saved  : {out.relative_to(ROOT)}  (patched + supplier_profile)")
+
+    return features
+
+
+# Step 6c: Compute size tier and affordability ceiling
+
+def step6c_size_tier_and_affordability(
+    features:    pd.DataFrame,
+    merged_path: Path,
+) -> pd.DataFrame:
+    _section("Step 6c: Computing size tier and affordability ceiling")
+
+    if not merged_path.exists():
+        _log("merged_dataset.parquet not found — skipping size tier")
+        features["median_monthly_spend"]    = 0.0
+        features["active_months_last_12"]   = 0
+        features["size_tier"]               = "new"
+        features["affordability_ceiling"]   = 0.0
+        return features
+
+    con = _con(memory_gb=5, threads=2)
+
+    # Compute monthly spend per customer per year-month
+    _log("Computing monthly spend per customer...")
+    monthly_spend = con.execute(f"""
+        SELECT
+            CAST(DIM_CUST_CURR_ID AS BIGINT)                 AS cust_id,
+            order_year,
+            order_month,
+            SUM(UNIT_SLS_AMT)                                 AS month_spend
+        FROM read_parquet('{merged_path.as_posix()}')
+        WHERE UNIT_SLS_AMT > 0
+          AND DIM_CUST_CURR_ID IS NOT NULL
+        GROUP BY CAST(DIM_CUST_CURR_ID AS BIGINT), order_year, order_month
+    """).df()
+
+    _log(f"Monthly spend rows: {len(monthly_spend):,}")
+
+    # Compute median monthly spend and active months per customer
+    size_stats = (
+        monthly_spend.groupby("cust_id")["month_spend"]
+        .agg(["median", "count"])
+        .reset_index()
+        .rename(columns={
+            "median": "median_monthly_spend",
+            "count":  "active_months_total",
+        })
+    )
+    size_stats["median_monthly_spend"] = size_stats["median_monthly_spend"].round(2)
+
+    _log(f"Customers with spending history: {len(size_stats):,}")
+    _log(f"  median_monthly_spend p25:    ${size_stats['median_monthly_spend'].quantile(0.25):,.2f}")
+    _log(f"  median_monthly_spend median: ${size_stats['median_monthly_spend'].median():,.2f}")
+    _log(f"  median_monthly_spend p75:    ${size_stats['median_monthly_spend'].quantile(0.75):,.2f}")
+    _log(f"  median_monthly_spend p95:    ${size_stats['median_monthly_spend'].quantile(0.95):,.2f}")
+    _log(f"  median_monthly_spend max:    ${size_stats['median_monthly_spend'].max():,.2f}")
+
+    # Count active months in the last 12 months only
+    max_ym = con.execute(f"""
+        SELECT MAX(order_year * 100 + order_month)
+        FROM read_parquet('{merged_path.as_posix()}')
+        WHERE UNIT_SLS_AMT > 0
+    """).fetchone()[0]
+
+    max_year  = int(max_ym // 100)
+    max_month = int(max_ym % 100)
+    cutoff_minus_12 = max_year * 100 + max_month - 100
+
+    _log(f"Dataset max year-month: {max_year}-{max_month:02d}")
+    _log(f"Active months counted from: year-month {cutoff_minus_12}")
+
+    active_last_12 = con.execute(f"""
+        SELECT
+            CAST(DIM_CUST_CURR_ID AS BIGINT)                 AS cust_id,
+            COUNT(DISTINCT order_year * 100 + order_month)   AS active_months_last_12
+        FROM read_parquet('{merged_path.as_posix()}')
+        WHERE UNIT_SLS_AMT > 0
+          AND DIM_CUST_CURR_ID IS NOT NULL
+          AND (order_year * 100 + order_month) > {cutoff_minus_12}
+        GROUP BY CAST(DIM_CUST_CURR_ID AS BIGINT)
+    """).df()
+
+    con.close()
+
+    _log(f"Customers active in last 12 months: {len(active_last_12):,}")
+
+    size_stats = size_stats.merge(active_last_12, on="cust_id", how="left")
+    size_stats["active_months_last_12"] = size_stats["active_months_last_12"].fillna(0).astype(int)
+
+    # Assign size_tier
+    def _classify_size(row) -> str:
+        if row["active_months_last_12"] < MIN_ACTIVE_MONTHS_FOR_TIER:
+            return "new"
+        m = row["median_monthly_spend"]
+        if m < SIZE_TIER_SMALL_MAX:
+            return "small"
+        if m < SIZE_TIER_MID_MAX:
+            return "mid"
+        if m < SIZE_TIER_LARGE_MAX:
+            return "large"
+        return "enterprise"
+
+    size_stats["size_tier"] = size_stats.apply(_classify_size, axis=1)
+
+    # Compute affordability_ceiling
+    size_stats["affordability_multiplier"] = (
+        size_stats["size_tier"].map(AFFORDABILITY_MULTIPLIER)
+    )
+    size_stats["affordability_ceiling"] = (
+        size_stats["median_monthly_spend"] * size_stats["affordability_multiplier"]
+    ).round(2)
+
+    tier_counts = size_stats["size_tier"].value_counts()
+    _log("")
+    _log("Size tier distribution:")
+    for tier in ["new", "small", "mid", "large", "enterprise"]:
+        count = int(tier_counts.get(tier, 0))
+        pct = round(count / len(size_stats) * 100, 2) if len(size_stats) else 0
+        _log(f"  {tier:<12} {count:>8,} customers  ({pct}%)")
+
+    # Merge into features DataFrame
+    features = features.copy()
+    features["DIM_CUST_CURR_ID_int"] = features["DIM_CUST_CURR_ID"].astype("Int64")
+    size_stats["cust_id"] = size_stats["cust_id"].astype("Int64")
+
+    features = features.merge(
+        size_stats[[
+            "cust_id", "median_monthly_spend", "active_months_last_12",
+            "size_tier", "affordability_ceiling"
+        ]].rename(columns={"cust_id": "DIM_CUST_CURR_ID_int"}),
+        on="DIM_CUST_CURR_ID_int", how="left"
+    )
+
+    features["median_monthly_spend"]  = features["median_monthly_spend"].fillna(0.0)
+    features["active_months_last_12"] = features["active_months_last_12"].fillna(0).astype(int)
+    features["size_tier"]             = features["size_tier"].fillna("new")
+    features["affordability_ceiling"] = features["affordability_ceiling"].fillna(0.0)
+
+    features = features.drop(columns=["DIM_CUST_CURR_ID_int"])
+
+    _log("")
+    _log(f"Affordability ceiling distribution:")
+    _log(f"  p25:    ${features['affordability_ceiling'].quantile(0.25):,.2f}")
+    _log(f"  median: ${features['affordability_ceiling'].median():,.2f}")
+    _log(f"  p75:    ${features['affordability_ceiling'].quantile(0.75):,.2f}")
+    _log(f"  p95:    ${features['affordability_ceiling'].quantile(0.95):,.2f}")
+
+    out = OUT_FEATURES / "customer_features.parquet"
+    features.to_parquet(out, index=False)
+    _log(f"Saved  : {out.relative_to(ROOT)}  (with size_tier and affordability)")
 
     return features
 
@@ -1451,7 +1593,7 @@ def step9_write_audit(
         churn = pd.DataFrame([{"note": "churn_label not found"}])
     _save_audit(churn, OUT_AUDIT / "08_churn_labels.xlsx", "Churn Labels")
 
-    # Supplier profile audit (new)
+    # Supplier profile audit
     if "supplier_profile" in features.columns:
         sp = features["supplier_profile"].value_counts().reset_index()
         sp.columns = ["supplier_profile", "customer_count"]
@@ -1467,6 +1609,22 @@ def step9_write_audit(
     else:
         sp = pd.DataFrame([{"note": "supplier_profile not found"}])
     _save_audit(sp, OUT_AUDIT / "08b_supplier_profile.xlsx", "Supplier Profile")
+
+    # Size tier audit
+    if "size_tier" in features.columns:
+        st = features["size_tier"].value_counts().reset_index()
+        st.columns = ["size_tier", "customer_count"]
+        st["pct_of_total"] = (st["customer_count"] / st["customer_count"].sum() * 100).round(2)
+        st["rule_applied"] = st["size_tier"].map({
+            "new":        f"active_months_last_12 < {MIN_ACTIVE_MONTHS_FOR_TIER}",
+            "small":      f"median_monthly_spend < ${SIZE_TIER_SMALL_MAX:,}",
+            "mid":        f"${SIZE_TIER_SMALL_MAX:,} <= median_monthly_spend < ${SIZE_TIER_MID_MAX:,}",
+            "large":      f"${SIZE_TIER_MID_MAX:,} <= median_monthly_spend < ${SIZE_TIER_LARGE_MAX:,}",
+            "enterprise": f"median_monthly_spend >= ${SIZE_TIER_LARGE_MAX:,}",
+        })
+    else:
+        st = pd.DataFrame([{"note": "size_tier not found"}])
+    _save_audit(st, OUT_AUDIT / "08c_size_tier_distribution.xlsx", "Size Tier")
 
     _save_audit(
         pd.DataFrame(run_log) if run_log else pd.DataFrame(),
@@ -1563,7 +1721,6 @@ def step9b_excel_report(
             ("FEATURES",    "Customers with RFM",    f"{len(features):,}"),
         ], columns=["category", "metric", "value"])
 
-        # Append supplier profile rows to summary
         if "supplier_profile" in features.columns:
             sp_counts = features["supplier_profile"].value_counts()
             sp_rows = pd.DataFrame([
@@ -1572,6 +1729,17 @@ def step9b_excel_report(
                 ("SUPPLIER", "Mixed customers",             f"{int(sp_counts.get('mixed', 0)):,}"),
             ], columns=["category", "metric", "value"])
             summary = pd.concat([summary, sp_rows], ignore_index=True)
+
+        if "size_tier" in features.columns:
+            st_counts = features["size_tier"].value_counts()
+            st_rows = pd.DataFrame([
+                ("SIZE", "New customers (<2 months active)",  f"{int(st_counts.get('new', 0)):,}"),
+                ("SIZE", "Small tier customers",              f"{int(st_counts.get('small', 0)):,}"),
+                ("SIZE", "Mid tier customers",                f"{int(st_counts.get('mid', 0)):,}"),
+                ("SIZE", "Large tier customers",              f"{int(st_counts.get('large', 0)):,}"),
+                ("SIZE", "Enterprise tier customers",         f"{int(st_counts.get('enterprise', 0)):,}"),
+            ], columns=["category", "metric", "value"])
+            summary = pd.concat([summary, st_rows], ignore_index=True)
 
         summary.to_excel(writer, sheet_name="01_pipeline_summary", index=False)
         _sheet(writer.sheets["01_pipeline_summary"], summary, "1F4E79", "1F4E79")
@@ -1691,10 +1859,12 @@ def step10_summary(
         for p in ["medline_only", "mckesson_primary", "mixed"]:
             print(f"    {p:<20} {int(sp.get(p, 0)):>8,}")
 
-    print()
-    print("  Data is ready for model training.")
-    print()
-
+    if "size_tier" in features.columns:
+        st = features["size_tier"].value_counts()
+        print()
+        print("  Size tier distribution:")
+        for t in ["new", "small", "mid", "large", "enterprise"]:
+            print(f"    {t:<12} {int(st.get(t, 0)):>8,}")
 
 # Main
 
@@ -1761,6 +1931,12 @@ def main() -> None:
         features, OUT_SERVING / "merged_dataset.parquet"
     )
     _rlog("Step 6b", f"category features patched + supplier_profile added  |  "
+                      f"{len(features.columns)} features")
+
+    features = step6c_size_tier_and_affordability(
+        features, OUT_SERVING / "merged_dataset.parquet"
+    )
+    _rlog("Step 6c", f"size_tier and affordability_ceiling computed  |  "
                       f"{len(features.columns)} features")
 
     step9_write_audit(

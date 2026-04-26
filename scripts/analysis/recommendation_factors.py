@@ -1,23 +1,13 @@
 from __future__ import annotations
 
-import json
+import gc
 import sys
 import time
 import warnings
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, classification_report
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, Reference
 
 warnings.filterwarnings("ignore")
 
@@ -26,1292 +16,1811 @@ warnings.filterwarnings("ignore")
 
 ROOT         = Path(__file__).resolve().parent.parent.parent
 DATA_CLEAN   = ROOT / "data_clean"
-MERGED_FILE  = DATA_CLEAN / "serving"  / "merged_dataset.parquet"
-PROD_FILE    = DATA_CLEAN / "product"  / "products_clean.parquet"
-CUST_FILE    = DATA_CLEAN / "customer" / "customers_clean.parquet"
-FEATURE_FILE = DATA_CLEAN / "features" / "customer_features.parquet"
-RFM_FILE     = DATA_CLEAN / "features" / "customer_rfm.parquet"
-OUT_PRECOMP  = DATA_CLEAN / "serving"  / "precomputed"
-OUT_ANALYSIS = DATA_CLEAN / "analysis"
+PRECOMP      = DATA_CLEAN / "serving" / "precomputed"
+FEATURES     = DATA_CLEAN / "features"
+ANALYSIS     = DATA_CLEAN / "analysis"
 
-# DuckDB spill directory — used when memory runs out during the big aggregation
-SPILL_DIR = DATA_CLEAN / "_duckdb_spill"
+# Input files
+
+CUST_SEG_FILE       = PRECOMP  / "customer_segments.parquet"
+CUST_PATT_FILE      = PRECOMP  / "customer_patterns.parquet"
+SEG_PROFILE_FILE    = PRECOMP  / "segment_category_profiles.parquet"
+PROD_SEG_FILE       = PRECOMP  / "product_segments.parquet"
+PROD_SPEC_FILE      = PRECOMP  / "product_specialty.parquet"
+ITEM_SIM_FILE       = PRECOMP  / "item_similarity.parquet"
+COOCCUR_FILE        = PRECOMP  / "product_cooccurrence.parquet"
+LAPSED_FILE         = PRECOMP  / "customer_lapsed_products.parquet"
+PB_EQUIV_FILE       = PRECOMP  / "private_brand_equivalents.parquet"
+# Phase 6: peer-validated replenishment inputs
+REPLENISHMENT_FILE  = PRECOMP  / "customer_replenishment_candidates.parquet"
+SEG_CADENCE_FILE    = PRECOMP  / "product_segment_cadence.parquet"
+FEATURE_FILE        = FEATURES / "customer_features.parquet"
+MERGED_FILE         = DATA_CLEAN / "serving" / "merged_dataset.parquet"
+
+# Output files
+
+RECS_OUT          = PRECOMP  / "recommendations.parquet"
+RECS_SAMPLE_XLSX  = ANALYSIS / "recommendations_sample.xlsx"
 
 
 # Configuration
 
-ITEM_ID_COL       = "DIM_ITEM_E1_CURR_ID"
-ITEM_DSC_COL      = "ITEM_DSC"
-PROD_FAMILY_COL   = "PROD_FMLY_LVL1_DSC"
-PROD_CATEG_COL    = "PROD_CTGRY_LVL2_DSC"
-CUST_ID_COL       = "DIM_CUST_CURR_ID"
-REVENUE_COL       = "UNIT_SLS_AMT"
-SPCLTY_COL        = "SPCLTY_CD"
-PRIVATE_BRAND_COL = "is_private_brand"
+TOP_N_RECS              = 10
+TOP_N_PER_TYPE          = 20
+TOP_N_CANDIDATES        = 50
+MIN_PEER_ADOPTION       = 0.30
+MIN_PRODUCT_BUYERS      = 50
+AFFORDABILITY_GRACE     = 1.2
+RECENCY_MAX_MONTHS      = 6
 
-FISCAL_YEARS     = ("FY2425", "FY2526")
+# Specialty match multipliers
+SPECIALTY_MATCH_BOOST    = 1.2
+SPECIALTY_NEUTRAL        = 1.0
+SPECIALTY_MISMATCH_PENALTY = 0.7
+UNIVERSAL_HHI_THRESHOLD  = 0.30
 
-EXCLUDED_SUPPLIERS = ("MEDLINE", "MEDLINE INDUSTRIES")
-EXCLUDED_FAMILIES  = {"Fee", "Unknown", "NaN", "nan", ""}
+# Cold-start
+COLDSTART_MIN_MARKET_PCT = 0.30
+COLDSTART_MIN_SIZE_PCT   = 0.25
 
-MIN_PEER_SIZE      = 5
-MIN_ADOPTION_PCT   = 0.15
-MIN_PEER_PURCHASES = 3
+# Cart complement
+CART_MIN_LIFT            = 2.0
+CART_TOP_N_PER_CUST      = 15
+CART_MAX_HISTORY_PRODS   = 50
 
-LAPSE_MULTIPLIER = 2.5
+# Item similarity
+SIM_MIN_SCORE            = 0.10
+SIM_TOP_N_PER_CUST       = 15
+SIM_MAX_HISTORY_PRODS    = 30
 
-TOP_N_RECS = 10
+# Lapsed recovery
+LAPSED_MIN_HISTORICAL_QTY = 2
+LAPSED_TOP_N_PER_CUST     = 10
 
-# Scoring weights per segment tier.
-#
-# Formula for peer_gap score:  2.0 * adoption_rate * peer_w
-# Formula for lapsed   score:  lapsed_w
-# Private brand bonus:         +0.5 added after the base score
-#
-# Math validation at peer_gap adoption_rate = 0.50 (typical top-ranked peer product):
-#   _high tier: 2 * 0.50 * 3.5 = 3.50 vs lapsed 1.0 -> peer_gap dominates
-#   _mid  tier: 2 * 0.50 * 2.5 = 2.50 vs lapsed 2.5 -> balanced (tie at 0.5)
-#   _low  tier: 2 * 0.50 * 1.0 = 1.00 vs lapsed 3.5 -> lapsed dominates
-#
-# For mid-tier customers, products with adoption > 0.50 win as peer_gap,
-# products with adoption < 0.50 lose to lapsed. Result: roughly 50/50 split.
+# Phase 6: Replenishment signal
+# customer_replenishment_candidates.parquet is built upstream by
+# analyze_buying_patterns.py with peer-validated logic:
+#   - Customer must have bought the product before
+#   - Peers in the customer's segment must still be buying it (alive >= 30%)
+#   - Customer's days_since_last must be >= 1.5x segment median cadence
+# Here we just score, rank, and emit recommendations. We do NOT apply
+# apply_already_buys_filter for this signal - the whole point is to surface
+# things the customer already buys but is overdue on (same exemption that
+# lapsed_recovery uses).
+REPLENISHMENT_TOP_N_PER_CUST = 10
+# Soft cap on overdue_ratio used in scoring. Customers with overdue_ratio
+# above this are still surfaced but capped so a 365x outlier doesn't drown
+# out a clean 2x candidate. Mirrors how the dollar_factor in PB upgrades
+# is clipped before log1p.
+REPLENISHMENT_OVERDUE_CAP    = 5.0
 
-SEGMENT_WEIGHTS: dict[str, tuple[float, float]] = {
-    "PO_high":  (3.5, 1.0),
-    "LTC_high": (3.5, 1.0),
-    "SC_high":  (3.5, 1.0),
-    "HC_high":  (3.5, 1.0),
-    "LC_high":  (3.5, 1.0),
-    "AC_high":  (3.5, 1.0),
-    "PO_mid":   (2.5, 2.5),
-    "LTC_mid":  (2.5, 2.5),
-    "SC_mid":   (2.5, 2.5),
-    "HC_mid":   (2.5, 2.5),
-    "LC_mid":   (2.5, 2.5),
-    "AC_mid":   (2.5, 2.5),
-    "PO_low":   (1.0, 3.5),
-    "LTC_low":  (1.0, 3.5),
-    "SC_low":   (1.0, 3.5),
-    "HC_low":   (1.0, 3.5),
-    "LC_low":   (1.0, 3.5),
-    "AC_low":   (1.0, 3.5),
-    "OTHER_low": (1.0, 3.5),
-    "unknown":   (3.0, 2.0),
+# Type-specific score boosts
+BOOST_PEER_GAP           = 0.0
+BOOST_CART_COMPLEMENT    = 0.5
+BOOST_ITEM_SIMILARITY    = 0.3
+BOOST_LAPSED_RECOVERY    = 0.7
+BOOST_MEDLINE_CONVERSION = 0.8
+BOOST_PB_UPGRADE         = 0.5
+BOOST_REPLENISHMENT      = 0.6   # Phase 6
+
+# Phase 5: Specialty match enforcement
+# When a customer has >= this many history products, we know what they buy,
+# so drop "mismatch" recs (specialty_hhi >= 0.30 and not in their specialty).
+# Cold-start customers (history < threshold) are exempt - they need broad recs.
+SPECIALTY_FILTER_MIN_HISTORY = 10
+
+# Phase 5: Score normalization
+# After all signals are generated, normalize scores within each signal type
+# to a 0-1 rank-percentile so signals compete fairly in the final ranker.
+# This prevents popularity (median ~60) from dominating peer_gap (median ~10),
+# while preserving the within-signal ordering.
+NORMALIZED_SCORE_COL = "normalized_score"
+
+# Diversification quotas (Phase 3 + Phase 6)
+QUOTAS = {
+    "medline_conversion":     2,
+    "private_brand_upgrade":  2,
+    "lapsed_recovery":        2,
+    "replenishment":          3,   # Phase 6: peer-validated reorder candidates
+    "cart_complement":        3,
+    "item_similarity":        2,
+    "peer_gap":               4,
+    "popularity":             10,
 }
-DEFAULT_WEIGHTS = (3.0, 2.0)
-PRIVATE_BRAND_BONUS = 0.5
+
+BACKFILL_ORDER = [
+    "peer_gap", "cart_complement", "popularity",
+    "item_similarity", "lapsed_recovery", "replenishment",
+]
+
+# Rec purpose mapping (Phase 4 + Phase 6)
+# Each signal_type maps to a business purpose for tracking
+SIGNAL_TO_PURPOSE = {
+    "peer_gap":              "new_product",
+    "cart_complement":       "new_product",
+    "popularity":            "new_product",
+    "lapsed_recovery":       "win_back",
+    "replenishment":         "replenishment",   # Phase 6: distinct purpose
+    "item_similarity":       "cross_sell",
+    "medline_conversion":    "mckesson_substitute",
+    "private_brand_upgrade": "mckesson_substitute",
+}
 
 
 # Logging
 
 def _s(title: str) -> None:
-    print(f"\n{'-'*64}\n  {title}\n{'-'*64}", flush=True)
+    print(f"\n{'-' * 64}\n  {title}\n{'-' * 64}", flush=True)
+
 
 def _log(msg: str) -> None:
     print(f"  {msg}", flush=True)
 
 
-# Excel helpers
+# Step 1: Load inputs
 
-def _style(ws, df: pd.DataFrame, hc: str = "1F4E79") -> None:
-    thin = Side(style="thin", color="CCCCCC")
-    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for ci, col in enumerate(df.columns, 1):
-        c = ws.cell(1, ci, str(col))
-        c.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor=hc)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = bdr
-    for ri, row in enumerate(df.itertuples(index=False), 2):
-        bg = "F2F7FF" if ri % 2 == 0 else "FFFFFF"
-        for ci, val in enumerate(row, 1):
-            c = ws.cell(ri, ci, val if pd.notna(val) else "")
-            c.font = Font(name="Arial", size=9)
-            c.fill = PatternFill("solid", fgColor=bg)
-            c.alignment = Alignment(horizontal="left", vertical="center")
-            c.border = bdr
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for col_cells in ws.columns:
-        w = max((len(str(c.value)) if c.value else 0) for c in col_cells)
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max(w+2, 12), 55)
-
-
-def _chart(ws, n, lc, vc, anchor, title, xtitle, color="1F4E79") -> None:
-    ch = BarChart()
-    ch.type = "bar"; ch.grouping = "clustered"; ch.title = title
-    ch.x_axis.title = xtitle; ch.legend = None
-    ch.width = 26; ch.height = 16; ch.style = 2
-    ch.add_data(Reference(ws, min_col=vc, min_row=1, max_row=n+1), titles_from_data=True)
-    ch.set_categories(Reference(ws, min_col=lc, min_row=2, max_row=n+1))
-    ch.series[0].graphicalProperties.solidFill = color
-    ch.series[0].graphicalProperties.line.solidFill = color
-    ws.add_chart(ch, anchor)
-
-
-# DuckDB connection with memory-safe settings
-
-def _memory_safe_duckdb() -> duckdb.DuckDBPyConnection:
-    # Open DuckDB with conservative memory settings.
-    # - 4 GB hard limit (leaves room for pandas + Python + OS)
-    # - 1 thread (each thread has its own working memory)
-    # - preserve_insertion_order = false (reduces memory overhead)
-    # - spill to disk when memory runs out
-
-    SPILL_DIR.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(":memory:")
-    con.execute("SET memory_limit = '4GB'")
-    con.execute("SET threads = 1")
-    con.execute("SET preserve_insertion_order = false")
-    con.execute(f"SET temp_directory = '{SPILL_DIR.as_posix()}'")
-    return con
-
-
-# Step 1: Load features and build peer groups
-
-def load_features_and_segments() -> pd.DataFrame:
-    # Pull customer features and attach peer_group. Returns ~389k rows.
-
-    _s("Step 1: Loading customer features and building peer groups")
-
-    feat_cols_all = set(
-        duckdb.connect().execute(
-            f"DESCRIBE SELECT * FROM read_parquet('{FEATURE_FILE.as_posix()}') LIMIT 0"
-        ).fetchdf()["column_name"].tolist()
-    )
-    wanted = [
-        "DIM_CUST_CURR_ID", "SPCLTY_CD", "R_score", "F_score",
-        "monetary", "recency_days", "frequency",
-        "avg_order_gap_days", "specialty_tier", "CUST_TYPE_CD", "MKT_CD",
-        "supplier_profile",
-        "pct_of_total_revenue", "specialty_revenue_trend_pct",
-        "avg_revenue_per_order", "n_categories_bought",
-        "category_hhi", "cycle_regularity", "M_score",
-    ]
-    cols = [c for c in wanted if c in feat_cols_all]
-    features = pd.read_parquet(FEATURE_FILE, columns=cols)
-    _log(f"Loaded: {len(features):,} customers  |  {len(cols)} columns")
-
-    if "supplier_profile" not in features.columns:
-        _log("Warning: supplier_profile missing — defaulting all to 'mixed'")
-        features["supplier_profile"] = "mixed"
-    else:
-        features["supplier_profile"] = features["supplier_profile"].fillna("mixed")
-
-    def rfm_tier(r):
-        if r["R_score"] >= 4 and r["F_score"] >= 4:
-            return "high"
-        elif r["R_score"] <= 2 or r["F_score"] <= 2:
-            return "low"
-        return "mid"
-
-    features["rfm_tier"]   = features.apply(rfm_tier, axis=1)
-    features["peer_group"] = (
-        features["SPCLTY_CD"].fillna("UNKNOWN") + "|" + features["rfm_tier"]
-    )
-    tier3 = features["specialty_tier"] == 3
-    features.loc[tier3, "peer_group"] = "TIER3|" + features.loc[tier3, "rfm_tier"]
-
-    peer_sizes = features.groupby("peer_group").size()
-    _log(f"Total peer groups       : {features['peer_group'].nunique():,}")
-    _log(f"Groups >= {MIN_PEER_SIZE} customers  : {(peer_sizes >= MIN_PEER_SIZE).sum():,}")
-
-    return features
-
-
-# Step 2: Aggregate customer-product history in DuckDB
-
-def load_customer_product_history(features: pd.DataFrame) -> pd.DataFrame:
-    # Two-step strategy for memory safety on 8-16 GB machines:
-    #   Step 2a: Write filtered+aggregated transactions to a disk parquet.
-    #            Only keep the numeric/ID columns we need for aggregation.
-    #            DuckDB streams this and spills to disk when RAM fills up.
-    #   Step 2b: Join product metadata (item_dsc, prod_family, etc.)
-    #            and customer peer_group from smaller tables.
-
-    _s("Step 2: Aggregating customer-product purchase history (DuckDB, two-pass)")
-
-    # Step 2a: numeric-only aggregation (streams through DuckDB, spills to disk)
-
-    tmp_agg = SPILL_DIR / "_history_agg.parquet"
-    SPILL_DIR.mkdir(parents=True, exist_ok=True)
-
-    con = _memory_safe_duckdb()
-
-    desc = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{MERGED_FILE.as_posix()}') LIMIT 0"
-    ).fetchdf()
-    cols = set(desc["column_name"].tolist())
-    required = {ITEM_ID_COL, PROD_FAMILY_COL, CUST_ID_COL,
-                REVENUE_COL, PRIVATE_BRAND_COL}
-    missing = required - cols
-    if missing:
-        raise ValueError(f"Missing columns in merged_dataset: {missing}")
-
-    supplier_col = next(
-        (c for c in ["SUPLR_ROLLUP_DSC", "SUPLR_DSC"] if c in cols), None
-    )
-    if supplier_col:
-        excl_sql = ", ".join(f"'{s}'" for s in EXCLUDED_SUPPLIERS)
-        supplier_filter = (
-            f"AND UPPER(COALESCE({supplier_col}, '')) NOT IN ({excl_sql})"
-        )
-        _log(f"Supplier exclusion  : {list(EXCLUDED_SUPPLIERS)} via {supplier_col}")
-    else:
-        supplier_filter = ""
-        _log("Supplier exclusion  : supplier column absent")
-
-    family_excl_sql = ", ".join(f"'{f}'" for f in sorted(EXCLUDED_FAMILIES))
-    _log(f"Family exclusion    : {sorted(EXCLUDED_FAMILIES)}")
-
-    fy_sql = ", ".join(f"'{fy}'" for fy in FISCAL_YEARS)
-    _log(f"Fiscal years        : {list(FISCAL_YEARS)}")
-
+def load_inputs() -> dict:
+    _s("Step 1: Loading input files")
     t0 = time.time()
-    _log("Step 2a: Streaming aggregation to disk (~3-6 minutes)...")
 
-    # COPY to parquet rather than returning a pandas DF.
-    # DuckDB streams this and can spill to temp_directory as needed.
-    # We aggregate only numeric columns — no ANY_VALUE() on strings yet.
-    con.execute(f"""
-        COPY (
-            SELECT
-                CAST({CUST_ID_COL} AS BIGINT)  AS cust_id,
-                CAST({ITEM_ID_COL} AS BIGINT)  AS item_id,
-                SUM({REVENUE_COL})              AS total_spend,
-                COUNT(DISTINCT ORDR_NUM)        AS order_count,
-                MAX(DIM_ORDR_DT_ID)             AS last_order_dt
-            FROM read_parquet('{MERGED_FILE.as_posix()}')
-            WHERE {REVENUE_COL} > 0
-              AND fiscal_year IN ({fy_sql})
-              AND {ITEM_ID_COL} IS NOT NULL
-              AND {CUST_ID_COL} IS NOT NULL
-              AND COALESCE({PROD_FAMILY_COL}, '') NOT IN ({family_excl_sql})
-              {supplier_filter}
-            GROUP BY
-                CAST({CUST_ID_COL} AS BIGINT),
-                CAST({ITEM_ID_COL} AS BIGINT)
-        ) TO '{tmp_agg.as_posix()}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-    """)
-    _log(f"Step 2a complete in {time.time()-t0:.1f}s")
+    customers = pd.read_parquet(CUST_SEG_FILE)
+    customers["DIM_CUST_CURR_ID"] = customers["DIM_CUST_CURR_ID"].astype("int64")
+    _log(f"customer_segments        : {len(customers):,} rows")
 
-    # Step 2b: join product and customer metadata back in
+    features = pd.read_parquet(FEATURE_FILE, columns=[
+        "DIM_CUST_CURR_ID", "median_monthly_spend",
+        "affordability_ceiling", "active_months_last_12", "SPCLTY_CD",
+    ])
+    features["DIM_CUST_CURR_ID"] = features["DIM_CUST_CURR_ID"].astype("int64")
+    _log(f"customer_features        : {len(features):,} rows")
 
-    _log("Step 2b: Joining product metadata and customer peer_group...")
+    patterns = pd.read_parquet(CUST_PATT_FILE)
+    patterns["DIM_CUST_CURR_ID"] = patterns["DIM_CUST_CURR_ID"].astype("int64")
+    _log(f"customer_patterns        : {len(patterns):,} rows")
 
-    # Register features subset for the join
-    con.register("features_df", features[[
-        "DIM_CUST_CURR_ID", "peer_group", "avg_order_gap_days"
-    ]])
+    seg_profiles = pd.read_parquet(SEG_PROFILE_FILE)
+    _log(f"segment_category_profiles: {len(seg_profiles):,} rows")
 
-    # Build product lookup from products_clean (much smaller than merged_dataset)
-    has_categ = PROD_CATEG_COL in cols
-    categ_col = PROD_CATEG_COL if has_categ else "'Unknown'"
+    products = pd.read_parquet(PROD_SEG_FILE)
+    products["DIM_ITEM_E1_CURR_ID"] = products["DIM_ITEM_E1_CURR_ID"].astype("int64")
 
-    t1 = time.time()
+    # Filter products with valid descriptions (Phase 4 fix - no nan ITEM_DSC pollution)
+    n_before = len(products)
+    products = products[
+        products["ITEM_DSC"].notna() &
+        (products["ITEM_DSC"].astype(str).str.strip() != "") &
+        (products["ITEM_DSC"].astype(str).str.lower() != "nan")
+    ].copy()
+    n_dropped = n_before - len(products)
+    _log(f"product_segments         : {len(products):,} rows (dropped {n_dropped:,} with null ITEM_DSC)")
+
+    spec_df = pd.read_parquet(PROD_SPEC_FILE)
+    spec_df["DIM_ITEM_E1_CURR_ID"] = spec_df["DIM_ITEM_E1_CURR_ID"].astype("int64")
+    _log(f"product_specialty        : {len(spec_df):,} rows")
+
+    item_sim = pd.read_parquet(ITEM_SIM_FILE)
+    item_sim["item_a"] = item_sim["item_a"].astype("int64")
+    item_sim["item_b"] = item_sim["item_b"].astype("int64")
+    _log(f"item_similarity          : {len(item_sim):,} pairs")
+
+    cooccur = pd.read_parquet(COOCCUR_FILE)
+    cooccur["product_a"] = cooccur["product_a"].astype("int64")
+    cooccur["product_b"] = cooccur["product_b"].astype("int64")
+    _log(f"product_cooccurrence     : {len(cooccur):,} pairs")
+
+    lapsed = pd.read_parquet(LAPSED_FILE)
+    lapsed["DIM_CUST_CURR_ID"]    = lapsed["DIM_CUST_CURR_ID"].astype("int64")
+    lapsed["DIM_ITEM_E1_CURR_ID"] = lapsed["DIM_ITEM_E1_CURR_ID"].astype("int64")
+    _log(f"customer_lapsed_products : {len(lapsed):,} pairs")
+
+    pb_equiv = pd.read_parquet(PB_EQUIV_FILE)
+    pb_equiv["original_item_id"]   = pb_equiv["original_item_id"].astype("int64")
+    pb_equiv["equivalent_item_id"] = pb_equiv["equivalent_item_id"].astype("int64")
+    _log(f"private_brand_equivalents: {len(pb_equiv):,} pairs")
+
+    # Phase 6: replenishment candidates and segment cadence
+    if REPLENISHMENT_FILE.exists():
+        replenishment = pd.read_parquet(REPLENISHMENT_FILE)
+        # The Phase 6 file uses cust_id / item_id internally; rename to match
+        # everything else in this engine.
+        rename_map = {}
+        if "cust_id" in replenishment.columns:
+            rename_map["cust_id"] = "DIM_CUST_CURR_ID"
+        if "item_id" in replenishment.columns:
+            rename_map["item_id"] = "DIM_ITEM_E1_CURR_ID"
+        if rename_map:
+            replenishment = replenishment.rename(columns=rename_map)
+        replenishment["DIM_CUST_CURR_ID"]    = replenishment["DIM_CUST_CURR_ID"].astype("int64")
+        replenishment["DIM_ITEM_E1_CURR_ID"] = replenishment["DIM_ITEM_E1_CURR_ID"].astype("int64")
+        _log(f"customer_replenishment   : {len(replenishment):,} candidates")
+    else:
+        replenishment = pd.DataFrame()
+        _log(f"customer_replenishment   : MISSING (Phase 6 file not found - replenishment signal will be skipped)")
+
+    _log(f"")
+    _log(f"All inputs loaded in {time.time()-t0:.1f}s")
+
+    return {
+        "customers":   customers, "features": features, "patterns": patterns,
+        "seg_profiles": seg_profiles, "products": products, "specialty": spec_df,
+        "item_sim": item_sim, "cooccur": cooccur,
+        "lapsed": lapsed, "pb_equiv": pb_equiv,
+        "replenishment": replenishment,
+    }
+
+
+# Step 2: Customer profile
+
+def build_customer_profile(inputs: dict) -> pd.DataFrame:
+    _s("Step 2: Building unified customer profile")
+    t0 = time.time()
+
+    cp = inputs["customers"].merge(inputs["features"], on="DIM_CUST_CURR_ID", how="left")
+    cp = cp.merge(
+        inputs["patterns"][[
+            "DIM_CUST_CURR_ID", "is_cold_start", "is_churned", "is_declining",
+            "order_cadence_tier", "n_unique_products_total", "is_single_order_customer",
+        ]],
+        on="DIM_CUST_CURR_ID", how="left"
+    )
+
+    cp["is_cold_start"] = cp["is_cold_start"].fillna(1).astype("int8")
+    cp["is_churned"]    = cp["is_churned"].fillna(0).astype("int8")
+    cp["is_declining"]  = cp["is_declining"].fillna(0).astype("int8")
+    cp["order_cadence_tier"]    = cp["order_cadence_tier"].fillna("no_data")
+    cp["affordability_ceiling"] = cp["affordability_ceiling"].fillna(0).astype("float32")
+    cp["SPCLTY_CD"] = cp["SPCLTY_CD"].fillna("UNKNOWN")
+    # Phase 5: keep n_unique_products_total available downstream for the
+    # specialty filter (we exempt customers with < SPECIALTY_FILTER_MIN_HISTORY).
+    cp["n_unique_products_total"] = cp["n_unique_products_total"].fillna(0).astype("int32")
+
+    n_cold = int(cp["is_cold_start"].sum())
+    n_warm = len(cp) - n_cold
+    _log(f"  Cold-start: {n_cold:,} ({n_cold/len(cp)*100:.1f}%)")
+    _log(f"  Warm      : {n_warm:,} ({n_warm/len(cp)*100:.1f}%)")
+    _log(f"Step 2 done in {time.time()-t0:.1f}s")
+
+    return cp
+
+
+# Step 3: Purchase history
+
+def load_customer_purchase_history() -> pd.DataFrame:
+    _s("Step 3: Loading customer purchase history")
+    t0 = time.time()
+
+    import duckdb
+    con = duckdb.connect()
+
     history = con.execute(f"""
         SELECT
-            h.cust_id,
-            h.item_id,
-            COALESCE(p.{ITEM_DSC_COL}, '')                      AS item_dsc,
-            COALESCE(p.{PROD_FAMILY_COL}, 'Unknown')            AS prod_family,
-            COALESCE({("p." + PROD_CATEG_COL) if has_categ else "'Unknown'"}, 'Unknown') AS prod_category,
-            COALESCE(p.{PRIVATE_BRAND_COL}, 0)                  AS is_private_brand,
-            h.total_spend,
-            h.order_count,
-            h.last_order_dt,
-            f.peer_group,
-            f.avg_order_gap_days
-        FROM read_parquet('{tmp_agg.as_posix()}') h
-        LEFT JOIN read_parquet('{PROD_FILE.as_posix()}') p
-            ON h.item_id = CAST(p.{ITEM_ID_COL} AS BIGINT)
-        LEFT JOIN features_df f
-            ON h.cust_id = CAST(f.DIM_CUST_CURR_ID AS BIGINT)
-    """).fetchdf()
+            CAST(DIM_CUST_CURR_ID AS BIGINT) AS DIM_CUST_CURR_ID,
+            CAST(DIM_ITEM_E1_CURR_ID AS BIGINT) AS DIM_ITEM_E1_CURR_ID,
+            SUM(UNIT_SLS_AMT) AS total_spend,
+            COUNT(*) AS n_lines
+        FROM read_parquet('{MERGED_FILE.as_posix()}')
+        WHERE UNIT_SLS_AMT > 0
+          AND DIM_CUST_CURR_ID IS NOT NULL
+          AND DIM_ITEM_E1_CURR_ID IS NOT NULL
+        GROUP BY
+            CAST(DIM_CUST_CURR_ID AS BIGINT),
+            CAST(DIM_ITEM_E1_CURR_ID AS BIGINT)
+    """).df()
     con.close()
 
-    _log(f"Step 2b complete in {time.time()-t1:.1f}s")
-    _log(f"Loaded {len(history):,} customer-product pairs total")
-    _log(f"Unique customers : {history['cust_id'].nunique():,}")
-    _log(f"Unique products  : {history['item_id'].nunique():,}")
-    _log(f"Unique families  : {history['prod_family'].nunique():,}")
+    history["DIM_CUST_CURR_ID"]   = history["DIM_CUST_CURR_ID"].astype("int64")
+    history["DIM_ITEM_E1_CURR_ID"] = history["DIM_ITEM_E1_CURR_ID"].astype("int64")
+    history["already_buys"] = 1
 
-    # Cleanup temp parquet
-    try:
-        tmp_agg.unlink()
-    except Exception:
-        pass
-
-    # Filter: rows must have peer_group AND not be in excluded families
-    # (excluded families could leak in if a product was reclassified between
-    # merged_dataset.parquet and products_clean.parquet — extremely unlikely
-    # but costs nothing to guard against)
-    before = len(history)
-    history = history[~history["prod_family"].isin(EXCLUDED_FAMILIES)]
-    history = history.dropna(subset=["peer_group"])
-    dropped = before - len(history)
-    if dropped > 0:
-        _log(f"Dropped {dropped:,} rows (no peer_group or excluded family)")
+    _log(f"Customer-product 'already buys' pairs: {len(history):,}")
+    _log(f"Step 3 done in {time.time()-t0:.1f}s")
 
     return history
 
 
-# Step 3: Peer adoption
+# Step 4: Filter eligible products
 
-def compute_peer_adoption(history: pd.DataFrame) -> pd.DataFrame:
-    _s("Step 3: Computing product adoption rates within peer groups")
+def filter_eligible_products(products: pd.DataFrame) -> pd.DataFrame:
+    _s("Step 4: Filtering eligible products")
 
-    peer_sizes = (
-        history[["cust_id", "peer_group"]]
-        .drop_duplicates()
-        .groupby("peer_group")
-        .size()
-        .reset_index(name="peer_group_size")
+    before = len(products)
+    products = products[products["is_discontinued"] == 0]
+    _log(f"  After is_discontinued=0    : {len(products):,} (dropped {before - len(products):,})")
+    before = len(products)
+    products = products[products["n_buyers"] >= MIN_PRODUCT_BUYERS]
+    _log(f"  After n_buyers>={MIN_PRODUCT_BUYERS}        : {len(products):,} (dropped {before - len(products):,})")
+    before = len(products)
+    products = products[
+        (products["months_since_last_buyer"] <= RECENCY_MAX_MONTHS) |
+        (products["months_since_last_buyer"].isna()) |
+        (products["months_since_last_buyer"] < 0)
+    ]
+    _log(f"  After months_since<={RECENCY_MAX_MONTHS}mo : {len(products):,} (dropped {before - len(products):,})")
+
+    return products
+
+
+# Helper functions
+
+def apply_specialty_scoring(candidates: pd.DataFrame, spec_slim: pd.DataFrame) -> pd.DataFrame:
+    candidates = candidates.merge(spec_slim, on="DIM_ITEM_E1_CURR_ID", how="left")
+
+    spec_cols = [f"top_specialty_{i}" for i in range(1, 6)]
+    in_top = pd.Series(False, index=candidates.index)
+    for col in spec_cols:
+        in_top = in_top | (candidates[col] == candidates["SPCLTY_CD"])
+
+    candidates["specialty_match"] = "neutral"
+    candidates.loc[in_top, "specialty_match"] = "match"
+    is_concentrated = candidates["specialty_hhi"].fillna(0) >= UNIVERSAL_HHI_THRESHOLD
+    has_known_spec = candidates["SPCLTY_CD"] != "UNKNOWN"
+    is_mismatch = (~in_top) & is_concentrated & has_known_spec
+    candidates.loc[is_mismatch, "specialty_match"] = "mismatch"
+
+    candidates["specialty_multiplier"] = candidates["specialty_match"].map({
+        "match": SPECIALTY_MATCH_BOOST,
+        "neutral": SPECIALTY_NEUTRAL,
+        "mismatch": SPECIALTY_MISMATCH_PENALTY,
+    }).astype("float32")
+
+    return candidates
+
+
+def apply_affordability_filter(candidates: pd.DataFrame) -> pd.DataFrame:
+    mask = (
+        candidates["buyer_affordability_p10"] <=
+        candidates["affordability_ceiling"].clip(lower=100) * AFFORDABILITY_GRACE
     )
+    return candidates[mask]
 
-    adoption = (
-        history.groupby(["peer_group", "item_id", "item_dsc",
-                          "prod_family", "prod_category", "is_private_brand"])
-        .agg(
-            buyer_count  = ("cust_id",    "nunique"),
-            total_orders = ("order_count", "sum"),
-            median_spend = ("total_spend", "median"),
-            total_spend  = ("total_spend", "sum"),
-        )
-        .reset_index()
+
+def apply_already_buys_filter(candidates: pd.DataFrame, history: pd.DataFrame) -> pd.DataFrame:
+    cust_ids = set(candidates["DIM_CUST_CURR_ID"].tolist())
+    sub_history = history[history["DIM_CUST_CURR_ID"].isin(cust_ids)][[
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID", "already_buys"
+    ]]
+    candidates = candidates.merge(
+        sub_history, on=["DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"], how="left"
     )
-
-    adoption = adoption.merge(peer_sizes, on="peer_group", how="left")
-    adoption["adoption_rate"] = (
-        adoption["buyer_count"] / adoption["peer_group_size"]
-    ).round(4)
-
-    adoption = adoption[
-        (adoption["buyer_count"]    >= MIN_PEER_PURCHASES) &
-        (adoption["peer_group_size"] >= MIN_PEER_SIZE)     &
-        (adoption["adoption_rate"]   >= MIN_ADOPTION_PCT)
-    ].copy()
-
-    adoption = adoption.sort_values(
-        ["peer_group", "adoption_rate"], ascending=[True, False]
-    ).reset_index(drop=True)
-
-    _log(f"Product-peer_group combos after filtering: {len(adoption):,}")
-    _log(f"Unique products in adoption table        : {adoption['item_id'].nunique():,}")
-
-    top_products = (
-        adoption.groupby(["item_id", "item_dsc", "prod_family"])
-        ["adoption_rate"].mean()
-        .sort_values(ascending=False)
-        .head(20)
-        .reset_index()
-    )
-    _log("\n  Top 10 products by avg peer adoption rate:")
-    for _, r in top_products.head(10).iterrows():
-        dsc = str(r["item_dsc"])[:48]
-        fam = str(r["prod_family"])[:28]
-        _log(f"  {dsc:<50} {fam:<30} {r['adoption_rate']:>10.1%}")
-
-    return adoption
+    candidates = candidates[candidates["already_buys"].isna()]
+    return candidates.drop(columns=["already_buys"])
 
 
-# Step 4: Lapsed products
+# Step 5: Peer gap (segment-chunked + customer-sub-chunked)
 
-def compute_lapsed_products(history: pd.DataFrame) -> pd.DataFrame:
-    _s("Step 4: Identifying lapsed products (due for reorder)")
-
-    ref_date = int(history["last_order_dt"].max())
-
-    def yyyymmdd_to_days_ago(d: int) -> int:
-        from datetime import datetime
-        ref = datetime.strptime(str(ref_date), "%Y%m%d")
-        try:
-            dt = datetime.strptime(str(int(d)), "%Y%m%d")
-            return max(0, (ref - dt).days)
-        except Exception:
-            return 999
-
-    history = history.copy()
-    history["days_since_last_order"] = history["last_order_dt"].apply(
-        yyyymmdd_to_days_ago
-    )
-
-    lapse_threshold = (
-        history["avg_order_gap_days"].fillna(30) * LAPSE_MULTIPLIER
-    )
-    history["is_lapsed"] = (
-        history["days_since_last_order"] > lapse_threshold
-    ).astype(int)
-
-    lapsed = history[history["is_lapsed"] == 1].copy()
-    lapsed["lapse_reason"] = lapsed.apply(
-        lambda r: (
-            f"Last ordered {r['days_since_last_order']:.0f} days ago "
-            f"(avg gap {r['avg_order_gap_days']:.0f}d — overdue by "
-            f"{r['days_since_last_order'] - r['avg_order_gap_days']:.0f}d)"
-        ), axis=1
-    )
-
-    _log(f"Total customer-product pairs   : {len(history):,}")
-    _log(f"Lapsed pairs (overdue reorder) : {len(lapsed):,} "
-         f"({len(lapsed)/len(history)*100:.1f}%)")
-
-    return lapsed[["cust_id", "item_id", "item_dsc", "prod_family",
-                   "prod_category", "is_private_brand", "total_spend",
-                   "days_since_last_order", "lapse_reason"]]
-
-
-# Step 5: Build recommendations
-
-def build_recommendations(
-    adoption:  pd.DataFrame,
-    history:   pd.DataFrame,
-    lapsed:    pd.DataFrame,
-    features:  pd.DataFrame,
+def generate_peer_gap_recs(
+    cp: pd.DataFrame, seg_profiles: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame, history: pd.DataFrame,
 ) -> pd.DataFrame:
-    _s("Step 5: Building per-customer recommendation list")
+    _s("Step 5: Generating peer-gap recommendations (segment-chunked)")
+    t0 = time.time()
 
-    seq_context: dict[str, dict[str, tuple]] = {}
-    seq_path = OUT_PRECOMP / "segment_sequences.parquet"
-    if seq_path.exists():
-        seq_df = pd.read_parquet(seq_path)
-        for _, row in seq_df.iterrows():
-            seg  = row["segment"]
-            from_cat = row["from_category"]
-            to_cat   = row["to_category"]
-            prob     = row["transition_prob"]
-            if seg not in seq_context:
-                seq_context[seg] = {}
-            if from_cat not in seq_context[seg]:
-                seq_context[seg][from_cat] = (to_cat, prob)
-        _log(f"Segment sequences loaded: {len(seq_context)} segments")
-    else:
-        _log("segment_sequences.parquet not found — pitch messages will omit sequence context")
+    warm = cp[cp["is_cold_start"] == 0].copy()
+    _log(f"Warm customers: {len(warm):,}")
 
-    seg_path = OUT_PRECOMP / "customer_segments.parquet"
-    cust_segment: dict[int, str] = {}
-    if seg_path.exists():
-        seg_labels = pd.read_parquet(seg_path, columns=["DIM_CUST_CURR_ID", "segment"])
-        cust_segment = dict(zip(
-            seg_labels["DIM_CUST_CURR_ID"].astype(int),
-            seg_labels["segment"]
-        ))
-        _log(f"Customer segments loaded: {len(cust_segment):,} customers")
-    else:
-        _log("customer_segments.parquet not found — recommendations will use 'unknown' segment")
+    high_adopt_full = seg_profiles[
+        seg_profiles["adoption_rate"] >= MIN_PEER_ADOPTION
+    ][["segment", "product_family", "adoption_rate"]].copy()
+    high_adopt_full = high_adopt_full.rename(columns={
+        "adoption_rate": "peer_adoption_rate",
+        "product_family": "PROD_FMLY_LVL1_DSC",
+    })
+    _log(f"  High-adoption pairs: {len(high_adopt_full):,}")
 
-    cust_supplier_profile: dict[int, str] = dict(zip(
-        features["DIM_CUST_CURR_ID"].astype(int),
-        features["supplier_profile"].fillna("mixed")
-    ))
-
-    cust_products = (
-        history.groupby("cust_id")["item_id"]
-        .apply(set)
-        .reset_index()
-        .rename(columns={"item_id": "bought_set"})
+    products = products.copy()
+    products["popularity_score"] = (
+        np.log1p(products["n_buyers"].astype("float32")) *
+        np.log1p(products["recent_buyer_count_6mo"].astype("float32"))
     )
+    products["family_rank"] = products.groupby("PROD_FMLY_LVL1_DSC")[
+        "popularity_score"
+    ].rank(method="first", ascending=False)
+    products_top = products[products["family_rank"] <= 100].copy()
 
-    cust_peers = features[["DIM_CUST_CURR_ID", "peer_group"]].copy()
-    cust_peers = cust_peers.rename(columns={"DIM_CUST_CURR_ID": "cust_id"})
-    cust_df = cust_products.merge(cust_peers, on="cust_id", how="inner")
+    products_top_slim = products_top[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "popularity_score",
+        "primary_market", "primary_market_pct",
+    ]].copy()
 
-    _log(f"Customers to score: {len(cust_df):,}")
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
 
-    lapsed_idx = (
-        lapsed.groupby("cust_id")[["item_id", "item_dsc", "prod_family",
-                                    "prod_category", "is_private_brand",
-                                    "lapse_reason"]]
-        .apply(lambda x: x.to_dict("records"))
-        .to_dict()
-    )
+    segments = warm["segment"].dropna().unique().tolist()
+    _log(f"  Processing {len(segments)} segments...")
 
-    adoption_by_peer = dict(iter(adoption.groupby("peer_group")))
+    CUST_CHUNK_SIZE = 10000
 
-    CHUNK = 10_000
+    def process_segment_chunk(seg_custs_chunk, seg_categories, seg_products):
+        if len(seg_custs_chunk) == 0:
+            return None
+
+        cust_cats = seg_custs_chunk.merge(seg_categories, on="segment", how="inner")
+        candidates = cust_cats.merge(seg_products, on="PROD_FMLY_LVL1_DSC", how="inner")
+        if len(candidates) == 0:
+            return None
+
+        candidates = apply_affordability_filter(candidates)
+        candidates = apply_already_buys_filter(candidates, history)
+        if len(candidates) == 0:
+            return None
+
+        candidates = apply_specialty_scoring(candidates, spec_slim)
+
+        candidates["base_score"] = (
+            candidates["peer_adoption_rate"] *
+            np.log1p(candidates["n_buyers"].astype("float32")) *
+            candidates["specialty_multiplier"]
+        )
+        candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.5
+        candidates["declining_boost"] = candidates["is_declining"] * 0.3
+        candidates["numeric_score"] = (
+            candidates["base_score"] + candidates["pb_boost"] +
+            candidates["declining_boost"] + BOOST_PEER_GAP
+        ).astype("float32")
+
+        candidates["primary_signal"] = "peer_gap"
+        candidates["confidence_tier"] = np.where(
+            (candidates["specialty_match"] == "match") &
+            (candidates["peer_adoption_rate"] >= 0.5), "high",
+            np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
+        )
+
+        candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+            "numeric_score"
+        ].rank(method="first", ascending=False)
+        candidates = candidates[candidates["rank"] <= TOP_N_PER_TYPE].copy()
+        candidates["rank"] = candidates["rank"].astype("int8")
+
+        return candidates
+
+    all_results = []
+    for seg_idx, seg in enumerate(segments, 1):
+        seg_custs = warm[warm["segment"] == seg][[
+            "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+            "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+            "is_declining", "is_churned", "n_unique_products_total",
+        ]]
+        if len(seg_custs) == 0:
+            continue
+
+        seg_categories = high_adopt_full[high_adopt_full["segment"] == seg]
+        if len(seg_categories) == 0:
+            continue
+
+        relevant_families = seg_categories["PROD_FMLY_LVL1_DSC"].unique()
+        seg_products = products_top_slim[
+            products_top_slim["PROD_FMLY_LVL1_DSC"].isin(relevant_families)
+        ]
+
+        n_custs = len(seg_custs)
+        if n_custs > CUST_CHUNK_SIZE:
+            n_chunks = (n_custs + CUST_CHUNK_SIZE - 1) // CUST_CHUNK_SIZE
+            for chunk_i in range(n_chunks):
+                start = chunk_i * CUST_CHUNK_SIZE
+                end   = min(start + CUST_CHUNK_SIZE, n_custs)
+                chunk = seg_custs.iloc[start:end].copy()
+                result = process_segment_chunk(chunk, seg_categories, seg_products)
+                if result is not None and len(result) > 0:
+                    all_results.append(result)
+                gc.collect()
+        else:
+            result = process_segment_chunk(seg_custs.copy(), seg_categories, seg_products)
+            if result is not None and len(result) > 0:
+                all_results.append(result)
+            gc.collect()
+
+        if seg_idx % 5 == 0 or seg_idx == len(segments):
+            _log(f"    Processed {seg_idx}/{len(segments)} segments  "
+                 f"(elapsed {time.time()-t0:.0f}s)")
+
+    if not all_results:
+        return pd.DataFrame()
+
+    final = pd.concat(all_results, ignore_index=True)
+    _log(f"  Final peer-gap recs: {len(final):,}")
+    _log(f"  Customers covered  : {final['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 5 done in {time.time()-t0:.1f}s")
+    return final
+
+
+# Step 6: Cold-start
+
+def generate_coldstart_recs(
+    cp: pd.DataFrame, products: pd.DataFrame,
+    specialty: pd.DataFrame, history: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 6: Generating cold-start recommendations")
+    t0 = time.time()
+
+    cold = cp[cp["is_cold_start"] == 1].copy()
+    _log(f"Cold-start customers: {len(cold):,}")
+
+    market_size_pairs = cold[["mkt_cd_clean", "size_tier"]].drop_duplicates()
+
     all_recs = []
+    for _, row in market_size_pairs.iterrows():
+        mkt, tier = row["mkt_cd_clean"], row["size_tier"]
+        mkt_col, tier_col = f"pct_buyers_{mkt}", f"pct_buyers_{tier}"
 
+        if mkt_col not in products.columns or tier_col not in products.columns:
+            continue
+
+        pool = products[
+            (products[mkt_col]  >= COLDSTART_MIN_MARKET_PCT) &
+            (products[tier_col] >= COLDSTART_MIN_SIZE_PCT)
+        ].copy()
+        if len(pool) == 0:
+            pool = products[products[mkt_col] >= COLDSTART_MIN_MARKET_PCT].copy()
+        if len(pool) == 0:
+            pool = products.copy()
+
+        pool["mkt_cd_clean"] = mkt
+        pool["size_tier"]    = tier
+        pool["popularity_score"] = (
+            np.log1p(pool["n_buyers"].astype("float32")) *
+            np.log1p(pool["recent_buyer_count_6mo"].astype("float32"))
+        )
+        pool = pool.nlargest(TOP_N_CANDIDATES, "popularity_score")
+        all_recs.append(pool)
+
+    pool_all = pd.concat(all_recs, ignore_index=True)
+
+    candidates = cold[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "n_unique_products_total",
+    ]].merge(
+        pool_all[[
+            "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+            "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+            "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+            "is_private_brand", "popularity_score",
+            "primary_market", "primary_market_pct",
+            "mkt_cd_clean", "size_tier",
+        ]],
+        on=["mkt_cd_clean", "size_tier"], how="inner"
+    )
+
+    candidates = apply_affordability_filter(candidates)
+    candidates = apply_already_buys_filter(candidates, history)
+
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
+    candidates = apply_specialty_scoring(candidates, spec_slim)
+
+    candidates["base_score"] = candidates["popularity_score"].astype("float32")
+    candidates["pb_boost"]   = candidates["is_private_brand"].fillna(0) * 0.3
+    candidates["spec_boost"] = (candidates["specialty_match"] == "match").astype("float32") * 0.5
+    candidates["declining_boost"] = 0.0
+    candidates["numeric_score"] = (
+        candidates["base_score"] + candidates["pb_boost"] + candidates["spec_boost"]
+    ).astype("float32")
+
+    candidates["primary_signal"]      = "popularity"
+    candidates["confidence_tier"]     = "medium"
+    candidates["peer_adoption_rate"]  = 0.0
+    candidates["is_declining"] = 0
+    candidates["is_churned"]   = 0
+    candidates["order_cadence_tier"] = "no_data"
+
+    candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+        "numeric_score"
+    ].rank(method="first", ascending=False)
+    candidates = candidates[candidates["rank"] <= TOP_N_PER_TYPE].copy()
+    candidates["rank"] = candidates["rank"].astype("int8")
+
+    _log(f"  Final cold-start recs: {len(candidates):,}")
+    _log(f"  Customers covered    : {candidates['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 6 done in {time.time()-t0:.1f}s")
+    return candidates
+
+
+# Step 7: Cart complement
+
+def generate_cart_complement_recs(
+    cp: pd.DataFrame, cooccur: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame, history: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 7: Generating cart complement recommendations")
     t0 = time.time()
-    for start in range(0, len(cust_df), CHUNK):
-        chunk = cust_df.iloc[start:start+CHUNK]
 
-        for _, crow in chunk.iterrows():
-            cust_id    = int(crow["cust_id"])
-            bought_set = crow["bought_set"]
-            peer_group = crow["peer_group"]
+    warm = cp[cp["is_cold_start"] == 0].copy()
 
-            seg_label = cust_segment.get(cust_id, "unknown")
-            peer_w, lapsed_w = SEGMENT_WEIGHTS.get(seg_label, DEFAULT_WEIGHTS)
+    cooccur_filt = cooccur[cooccur["lift"] >= CART_MIN_LIFT][[
+        "product_a", "product_b", "lift", "support_ab"
+    ]].copy()
+    cooccur_filt = cooccur_filt.rename(columns={
+        "product_a": "DIM_ITEM_E1_CURR_ID",
+        "product_b": "rec_item_id",
+        "support_ab": "support",
+    })
+    _log(f"  High-lift pairs (lift>={CART_MIN_LIFT}): {len(cooccur_filt):,}")
 
-            recs = {}
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
 
-            # Signal 1: peer_gap — products peers buy that this customer doesn't.
-            # Score formula: 2.0 * adoption_rate * peer_w
-            # At adoption 0.5 with mid-tier weight 2.5, score = 2.5 which exactly
-            # matches the lapsed flat score. Products with adoption > 0.5 tip toward
-            # peer_gap; products with adoption < 0.5 tip toward lapsed.
-            # This produces balanced 50/50 rank-1 mix in mid tiers while keeping
-            # peer_gap dominant in _high and lapsed dominant in _low tiers.
-            peer_products = adoption_by_peer.get(peer_group)
-            if peer_products is not None:
-                for _, prod in peer_products.iterrows():
-                    iid = int(prod["item_id"])
-                    if iid in bought_set:
-                        continue
-                    score = 2.0 * float(prod["adoption_rate"]) * peer_w
-                    if prod["is_private_brand"]:
-                        score += PRIVATE_BRAND_BONUS
-                    recs[iid] = {
-                        "item_id":          iid,
-                        "item_dsc":         prod["item_dsc"],
-                        "prod_family":      prod["prod_family"],
-                        "prod_category":    prod["prod_category"],
-                        "is_private_brand": int(prod["is_private_brand"]),
-                        "score":            score,
-                        "adoption_rate":    float(prod["adoption_rate"]),
-                        "peer_group_size":  int(prod["peer_group_size"]),
-                        "buyer_count":      int(prod["buyer_count"]),
-                        "median_peer_spend": float(prod["median_spend"]),
-                        "signal":           "peer_gap",
-                    }
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
 
-            # Signal 2: lapsed — products this customer used to buy but stopped.
-            # Score formula: lapsed_w (flat)
-            for lp in lapsed_idx.get(cust_id, []):
-                iid = int(lp["item_id"])
-                score = lapsed_w
-                if lp["is_private_brand"]:
-                    score += PRIVATE_BRAND_BONUS
-                if iid not in recs or recs[iid]["score"] < score:
-                    recs[iid] = {
-                        "item_id":          iid,
-                        "item_dsc":         lp["item_dsc"],
-                        "prod_family":      lp["prod_family"],
-                        "prod_category":    lp["prod_category"],
-                        "is_private_brand": int(lp["is_private_brand"]),
-                        "score":            score,
-                        "adoption_rate":    0.0,
-                        "peer_group_size":  0,
-                        "buyer_count":      0,
-                        "median_peer_spend": 0.0,
-                        "signal":           "lapsed",
-                    }
+    cust_profile_slim = warm[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
 
-            ranked = sorted(recs.values(), key=lambda x: x["score"], reverse=True)
-            supplier_profile = cust_supplier_profile.get(cust_id, "mixed")
+    segments = warm["segment"].dropna().unique().tolist()
+    _log(f"  Processing {len(segments)} segments...")
 
-            for rank, r in enumerate(ranked[:TOP_N_RECS], 1):
-                r["cust_id"]          = cust_id
-                r["segment"]          = seg_label
-                r["supplier_profile"] = supplier_profile
-                r["rank"]             = rank
-                r["pitch_message"]    = _make_pitch_message(
-                    r, seg_label, supplier_profile,
-                    seq_context.get(seg_label, {})
-                )
-                all_recs.append(r)
+    CUST_CHUNK_SIZE = 10000
 
-        if (start // CHUNK) % 5 == 0:
-            elapsed = time.time() - t0
-            pct = min(100, (start + CHUNK) / len(cust_df) * 100)
-            _log(f"  Progress: {pct:.0f}%  |  {elapsed:.0f}s elapsed  |  {len(all_recs):,} recs so far")
+    def process_cart_chunk(chunk_cust_ids):
+        chunk_history = history[history["DIM_CUST_CURR_ID"].isin(chunk_cust_ids)].copy()
+        chunk_history["spend_rank"] = chunk_history.groupby("DIM_CUST_CURR_ID")[
+            "total_spend"
+        ].rank(method="first", ascending=False)
+        chunk_history = chunk_history[chunk_history["spend_rank"] <= CART_MAX_HISTORY_PRODS]
 
-    recs_df = pd.DataFrame(all_recs)
-    _log(f"Total recommendation rows : {len(recs_df):,}")
-    _log(f"Customers with recs       : {recs_df['cust_id'].nunique():,}")
+        candidates = chunk_history[[
+            "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"
+        ]].merge(cooccur_filt, on="DIM_ITEM_E1_CURR_ID", how="inner")
+        if len(candidates) == 0:
+            return None
 
-    sig_counts = recs_df["signal"].value_counts()
-    _log(f"\n  Recommendation signal breakdown:")
-    for sig, cnt in sig_counts.items():
-        _log(f"    {sig:<20} {cnt:>8,} rows  ({cnt/len(recs_df)*100:.1f}%)")
+        candidates = candidates.groupby(
+            ["DIM_CUST_CURR_ID", "rec_item_id"], as_index=False
+        ).agg({"lift": "max", "support": "max"})
+        candidates = candidates.rename(columns={"rec_item_id": "DIM_ITEM_E1_CURR_ID"})
 
-    return recs_df
+        candidates = candidates.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+        candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
 
+        candidates = apply_affordability_filter(candidates)
+        candidates = apply_already_buys_filter(candidates, history)
+        if len(candidates) == 0:
+            return None
 
-def _make_pitch_message(
-    r: dict,
-    segment: str,
-    supplier_profile: str,
-    seq_context: dict,
-) -> str:
-    signal   = r["signal"]
-    dsc      = r["item_dsc"][:60] if r["item_dsc"] else "this product"
-    fam      = r.get("prod_family", "")
-    pb_label = " (McKesson private brand)" if r["is_private_brand"] else ""
-    seg_display = segment.replace("_", " ") if segment != "unknown" else "peer"
+        candidates = apply_specialty_scoring(candidates, spec_slim)
 
-    seq_suffix = ""
-    if fam and fam in seq_context:
-        next_cat, prob = seq_context[fam]
-        seq_suffix = (
-            f" Customers in this segment next buy {next_cat[:30]} "
-            f"{prob:.0f}% of the time."
+        candidates["base_score"] = (
+            np.log1p(candidates["lift"].astype("float32")) * 2.0 *
+            candidates["specialty_multiplier"]
+        )
+        candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.3
+        candidates["declining_boost"] = candidates["is_declining"] * 0.2
+        candidates["numeric_score"] = (
+            candidates["base_score"] + candidates["pb_boost"] +
+            candidates["declining_boost"] + BOOST_CART_COMPLEMENT
+        ).astype("float32")
+
+        candidates["primary_signal"]    = "cart_complement"
+        candidates["peer_adoption_rate"] = 0.0
+        candidates["confidence_tier"] = np.where(
+            candidates["lift"] >= 5.0, "high",
+            np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
         )
 
-    if supplier_profile == "medline_only":
-        prefix = "Medline substitution" if signal == "peer_gap" else "Reorder swap"
-    elif signal == "peer_gap":
-        if "_high" in segment:
-            prefix = "Cross-sell opportunity"
-        elif "_low" in segment:
-            prefix = "Category expansion"
+        candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+            "numeric_score"
+        ].rank(method="first", ascending=False)
+        candidates = candidates[candidates["rank"] <= CART_TOP_N_PER_CUST].copy()
+        candidates["rank"] = candidates["rank"].astype("int8")
+
+        return candidates
+
+    all_results = []
+    for seg_idx, seg in enumerate(segments, 1):
+        seg_cust_list = warm[warm["segment"] == seg]["DIM_CUST_CURR_ID"].tolist()
+        if not seg_cust_list:
+            continue
+
+        n_custs = len(seg_cust_list)
+        if n_custs > CUST_CHUNK_SIZE:
+            n_chunks = (n_custs + CUST_CHUNK_SIZE - 1) // CUST_CHUNK_SIZE
+            for chunk_i in range(n_chunks):
+                start = chunk_i * CUST_CHUNK_SIZE
+                end   = min(start + CUST_CHUNK_SIZE, n_custs)
+                chunk_ids = set(seg_cust_list[start:end])
+                result = process_cart_chunk(chunk_ids)
+                if result is not None and len(result) > 0:
+                    all_results.append(result)
+                gc.collect()
         else:
-            prefix = "Peer-adopted product"
-    elif signal == "lapsed":
-        if "_low" in segment or "_mid" in segment:
-            prefix = "Re-engagement priority"
+            result = process_cart_chunk(set(seg_cust_list))
+            if result is not None and len(result) > 0:
+                all_results.append(result)
+            gc.collect()
+
+        if seg_idx % 5 == 0 or seg_idx == len(segments):
+            _log(f"    Processed {seg_idx}/{len(segments)} segments  "
+                 f"(elapsed {time.time()-t0:.0f}s)")
+
+    if not all_results:
+        return pd.DataFrame()
+
+    final = pd.concat(all_results, ignore_index=True)
+    _log(f"  Final cart-complement recs: {len(final):,}")
+    _log(f"  Customers covered         : {final['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 7 done in {time.time()-t0:.1f}s")
+    return final
+
+
+# Step 8: Item similarity
+
+def generate_item_similarity_recs(
+    cp: pd.DataFrame, item_sim: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame, history: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 8: Generating item similarity recommendations")
+    t0 = time.time()
+
+    warm = cp[cp["is_cold_start"] == 0].copy()
+
+    sim_filt = item_sim[item_sim["similarity"] >= SIM_MIN_SCORE][[
+        "item_a", "item_b", "similarity"
+    ]].copy()
+    sim_filt = sim_filt.rename(columns={
+        "item_a": "DIM_ITEM_E1_CURR_ID",
+        "item_b": "rec_item_id",
+    })
+    _log(f"  Similarity pairs (sim>={SIM_MIN_SCORE}): {len(sim_filt):,}")
+
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
+
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
+
+    cust_profile_slim = warm[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
+
+    segments = warm["segment"].dropna().unique().tolist()
+    _log(f"  Processing {len(segments)} segments...")
+
+    CUST_CHUNK_SIZE = 10000
+
+    def process_sim_chunk(chunk_cust_ids):
+        chunk_history = history[history["DIM_CUST_CURR_ID"].isin(chunk_cust_ids)].copy()
+        chunk_history["spend_rank"] = chunk_history.groupby("DIM_CUST_CURR_ID")[
+            "total_spend"
+        ].rank(method="first", ascending=False)
+        chunk_history = chunk_history[chunk_history["spend_rank"] <= SIM_MAX_HISTORY_PRODS]
+
+        candidates = chunk_history[[
+            "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"
+        ]].merge(sim_filt, on="DIM_ITEM_E1_CURR_ID", how="inner")
+        if len(candidates) == 0:
+            return None
+
+        candidates = candidates.groupby(
+            ["DIM_CUST_CURR_ID", "rec_item_id"], as_index=False
+        ).agg({"similarity": "max"})
+        candidates = candidates.rename(columns={"rec_item_id": "DIM_ITEM_E1_CURR_ID"})
+
+        candidates = candidates.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+        candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
+
+        candidates = apply_affordability_filter(candidates)
+        candidates = apply_already_buys_filter(candidates, history)
+        if len(candidates) == 0:
+            return None
+
+        candidates = apply_specialty_scoring(candidates, spec_slim)
+
+        candidates["base_score"] = (
+            candidates["similarity"].astype("float32") * 5.0 *
+            candidates["specialty_multiplier"]
+        )
+        candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.3
+        candidates["declining_boost"] = candidates["is_declining"] * 0.2
+        candidates["numeric_score"] = (
+            candidates["base_score"] + candidates["pb_boost"] +
+            candidates["declining_boost"] + BOOST_ITEM_SIMILARITY
+        ).astype("float32")
+
+        candidates["primary_signal"]    = "item_similarity"
+        candidates["peer_adoption_rate"] = 0.0
+        candidates["confidence_tier"] = np.where(
+            candidates["similarity"] >= 0.30, "high",
+            np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
+        )
+
+        candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+            "numeric_score"
+        ].rank(method="first", ascending=False)
+        candidates = candidates[candidates["rank"] <= SIM_TOP_N_PER_CUST].copy()
+        candidates["rank"] = candidates["rank"].astype("int8")
+
+        return candidates
+
+    all_results = []
+    for seg_idx, seg in enumerate(segments, 1):
+        seg_cust_list = warm[warm["segment"] == seg]["DIM_CUST_CURR_ID"].tolist()
+        if not seg_cust_list:
+            continue
+
+        n_custs = len(seg_cust_list)
+        if n_custs > CUST_CHUNK_SIZE:
+            n_chunks = (n_custs + CUST_CHUNK_SIZE - 1) // CUST_CHUNK_SIZE
+            for chunk_i in range(n_chunks):
+                start = chunk_i * CUST_CHUNK_SIZE
+                end   = min(start + CUST_CHUNK_SIZE, n_custs)
+                chunk_ids = set(seg_cust_list[start:end])
+                result = process_sim_chunk(chunk_ids)
+                if result is not None and len(result) > 0:
+                    all_results.append(result)
+                gc.collect()
         else:
-            prefix = "Reorder reminder"
+            result = process_sim_chunk(set(seg_cust_list))
+            if result is not None and len(result) > 0:
+                all_results.append(result)
+            gc.collect()
+
+        if seg_idx % 5 == 0 or seg_idx == len(segments):
+            _log(f"    Processed {seg_idx}/{len(segments)} segments  "
+                 f"(elapsed {time.time()-t0:.0f}s)")
+
+    if not all_results:
+        return pd.DataFrame()
+
+    final = pd.concat(all_results, ignore_index=True)
+    _log(f"  Final item-similarity recs: {len(final):,}")
+    _log(f"  Customers covered         : {final['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 8 done in {time.time()-t0:.1f}s")
+    return final
+
+
+# Step 9: Lapsed recovery
+
+def generate_lapsed_recovery_recs(
+    cp: pd.DataFrame, lapsed: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 9: Generating lapsed recovery recommendations")
+    t0 = time.time()
+
+    if "total_qty" in lapsed.columns:
+        lapsed_filt = lapsed[lapsed["total_qty"] >= LAPSED_MIN_HISTORICAL_QTY].copy()
     else:
-        prefix = "Recommended product"
+        lapsed_filt = lapsed.copy()
+    _log(f"  Lapsed pairs (qty>={LAPSED_MIN_HISTORICAL_QTY}): {len(lapsed_filt):,}")
 
-    if signal == "peer_gap":
-        pct    = r["adoption_rate"] * 100
-        buyers = r["buyer_count"]
-        size   = r["peer_group_size"]
-        spend  = r["median_peer_spend"]
-        if supplier_profile == "medline_only":
-            return (
-                f"{prefix} — {dsc}{pb_label}: "
-                f"instead of Medline, {pct:.0f}% of similar {seg_display} customers "
-                f"buy this McKesson alternative ({buyers}/{size}). "
-                f"Peers spend ~${spend:,.0f} per order.{seq_suffix}"
-            )
-        return (
-            f"{prefix} — {dsc}{pb_label}: "
-            f"{pct:.0f}% of similar {seg_display} customers ({buyers}/{size}) "
-            f"buy this. Peers spend ~${spend:,.0f} per order.{seq_suffix}"
-        )
-    elif signal == "lapsed":
-        if supplier_profile == "medline_only":
-            return (
-                f"{prefix} — {dsc}{pb_label}: "
-                f"previously ordered, not reordered recently. "
-                f"Propose McKesson reorder in place of Medline.{seq_suffix}"
-            )
-        return (
-            f"{prefix} — {dsc}{pb_label}: "
-            f"previously ordered, not reordered recently. "
-            f"Easy re-engagement — they already know the product.{seq_suffix}"
-        )
-    return f"{prefix} — {dsc}{pb_label}: pitch opportunity.{seq_suffix}"
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
 
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
 
-# Step 6: Propensity model
+    cust_profile_slim = cp[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
 
-def compute_recommendation_factors(
-    history:   pd.DataFrame,
-    adoption:  pd.DataFrame,
-    features:  pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, float]:
-    _s("Step 6: Building purchase propensity dataset for recommendation model")
+    candidates = lapsed_filt.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+    candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
+    candidates = apply_affordability_filter(candidates)
+    candidates = apply_specialty_scoring(candidates, spec_slim)
 
-    bought_pairs = set(zip(
-        history["cust_id"].astype(int),
-        history["item_id"].astype(int)
-    ))
-    _log(f"Unique customer-product pairs in history : {len(bought_pairs):,}")
+    if "total_qty" in candidates.columns:
+        qty_score = np.log1p(candidates["total_qty"].astype("float32"))
+    else:
+        qty_score = pd.Series(1.0, index=candidates.index, dtype="float32")
 
-    cust_family_spend = (
-        history.groupby(["cust_id", "prod_family"])["total_spend"]
-        .sum()
-        .reset_index()
-        .rename(columns={"total_spend": "spend_in_family"})
+    candidates["base_score"] = (qty_score * 2.0 * candidates["specialty_multiplier"]).astype("float32")
+    candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.3
+    candidates["declining_boost"] = (
+        candidates["is_declining"] * 0.5 + candidates["is_churned"] * 0.7
+    )
+    candidates["numeric_score"] = (
+        candidates["base_score"] + candidates["pb_boost"] +
+        candidates["declining_boost"] + BOOST_LAPSED_RECOVERY
+    ).astype("float32")
+
+    candidates["primary_signal"]    = "lapsed_recovery"
+    candidates["peer_adoption_rate"] = 0.0
+    candidates["confidence_tier"] = np.where(
+        (candidates["is_declining"] == 1) | (candidates["is_churned"] == 1), "high",
+        np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
     )
 
-    family_counts = (
-        history.groupby("cust_id")["prod_family"]
-        .nunique()
-        .reset_index()
-        .rename(columns={"prod_family": "n_families_bought"})
-    )
+    candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+        "numeric_score"
+    ].rank(method="first", ascending=False)
+    candidates = candidates[candidates["rank"] <= LAPSED_TOP_N_PER_CUST].copy()
+    candidates["rank"] = candidates["rank"].astype("int8")
 
-    _log("Building customer-product candidate pairs...")
+    _log(f"  Final lapsed recovery recs: {len(candidates):,}")
+    _log(f"  Customers covered         : {candidates['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 9 done in {time.time()-t0:.1f}s")
+    return candidates
 
-    top_products_per_group = (
-        adoption
-        .sort_values(["peer_group", "adoption_rate"], ascending=[True, False])
-        .groupby("peer_group")
-        .head(50)
-        [["peer_group", "item_id", "item_dsc", "prod_family",
-          "adoption_rate", "is_private_brand",
-          "buyer_count", "median_spend"]]
-        .copy()
-    )
 
-    cust_peer = (
-        features[["DIM_CUST_CURR_ID", "peer_group"]]
-        .rename(columns={"DIM_CUST_CURR_ID": "cust_id"})
-        .dropna()
-    )
+# Step 9b (Phase 6): Replenishment - peer-validated reorder candidates
+#
+# This signal comes from the precomputed customer_replenishment_candidates.parquet
+# built in analyze_buying_patterns.py with peer-validation logic:
+#   - Customer must have bought the product before
+#   - Peers in the same segment must still be buying it (alive >= 30%)
+#   - Customer is overdue: days_since_last >= 1.5x segment median cadence
+#
+# This is the only signal besides lapsed_recovery that does NOT call
+# apply_already_buys_filter - the whole point is to surface things the
+# customer already buys but is overdue on.
+#
+# Scoring uses:
+#   - log1p(overdue_ratio) clipped to REPLENISHMENT_OVERDUE_CAP - so a 30x
+#     overdue (ie. dead products) doesn't drown out a clean 2x candidate.
+#   - peer_activity_rate as a confidence multiplier - the more peers still
+#     active, the more reliable the signal.
+#   - specialty_multiplier from the standard specialty scoring path.
+#   - declining/churned customer boost (these customers are exactly the
+#     replenishment use case).
 
-    pairs = cust_peer.merge(top_products_per_group, on="peer_group", how="inner")
-    _log(f"Candidate pairs (customer x peer product): {len(pairs):,}")
-
-    pairs["bought"] = pairs.apply(
-        lambda r: 1 if (int(r["cust_id"]), int(r["item_id"])) in bought_pairs else 0,
-        axis=1
-    )
-    pos_rate = pairs["bought"].mean() * 100
-    _log(f"Positive rate (customer already buys it): {pos_rate:.1f}%")
-    _log(f"Negatives (pitch candidates): {(pairs['bought']==0).sum():,}")
-
-    _cust_wanted = [
-        "DIM_CUST_CURR_ID", "specialty_tier",
-        "R_score", "F_score", "M_score",
-        "recency_days", "frequency", "monetary",
-        "avg_order_gap_days",
-        "pct_of_total_revenue",
-        "specialty_revenue_trend_pct",
-        "avg_revenue_per_order",
-        "n_categories_bought",
-        "category_hhi",
-        "cycle_regularity",
-    ]
-    _cust_available = [c for c in _cust_wanted if c in features.columns]
-    _cust_missing   = [c for c in _cust_wanted if c not in features.columns]
-    if _cust_missing:
-        _log(f"Note: {len(_cust_missing)} customer columns absent: {_cust_missing}")
-    cust_feats = features[_cust_available].rename(columns={"DIM_CUST_CURR_ID": "cust_id"})
-
-    fam_enc = {f: i for i, f in enumerate(pairs["prod_family"].dropna().unique())}
-    pairs["prod_family_encoded"] = pairs["prod_family"].map(fam_enc).fillna(-1)
-
-    item_group_count = (
-        adoption.groupby("item_id")["peer_group"]
-        .nunique()
-        .reset_index()
-        .rename(columns={"peer_group": "n_peer_groups_carrying"})
-    )
-
-    df = (
-        pairs
-        .merge(cust_feats,       on="cust_id",  how="left")
-        .merge(family_counts,    on="cust_id",  how="left")
-        .merge(item_group_count, on="item_id",  how="left")
-        .merge(
-            cust_family_spend,
-            on=["cust_id", "prod_family"],
-            how="left"
-        )
-    )
-    df["n_families_bought"]      = df["n_families_bought"].fillna(1)
-    df["n_peer_groups_carrying"] = df["n_peer_groups_carrying"].fillna(0)
-    df["spend_in_family"]        = df["spend_in_family"].fillna(0)
-
-    df["already_buys_this_family"] = (df["spend_in_family"] > 0).astype(int)
-    df["adoption_x_recency"] = (
-        df["adoption_rate"] * df["R_score"].fillna(1)
-    )
-
-    X_COLS_ALL = [
-        "adoption_rate",
-        "n_peer_groups_carrying",
-        "is_private_brand",
-        "prod_family_encoded",
-        "recency_days",
-        "frequency",
-        "monetary",
-        "avg_order_gap_days",
-        "R_score",
-        "F_score",
-        "M_score",
-        "specialty_tier",
-        "n_families_bought",
-        "already_buys_this_family",
-        "adoption_x_recency",
-        "spend_in_family",
-        "pct_of_total_revenue",
-        "specialty_revenue_trend_pct",
-    ]
-    X_cols = [c for c in X_COLS_ALL if c in df.columns]
-
-    product_feats     = {"adoption_rate", "n_peer_groups_carrying",
-                         "is_private_brand", "prod_family_encoded"}
-    customer_feats    = {"recency_days", "frequency", "monetary", "avg_order_gap_days",
-                         "R_score", "F_score", "M_score", "specialty_tier",
-                         "n_families_bought", "pct_of_total_revenue",
-                         "specialty_revenue_trend_pct"}
-    interaction_feats = {"already_buys_this_family", "adoption_x_recency",
-                         "spend_in_family"}
-
-    def get_group(f: str) -> str:
-        if f in product_feats:     return "PRODUCT"
-        if f in customer_feats:    return "CUSTOMER"
-        if f in interaction_feats: return "INTERACTION"
-        return "OTHER"
-
-    sample = df.sample(min(500_000, len(df)), random_state=42)
-    X = sample[X_cols].fillna(0)
-    y = sample["bought"]
-
-    _log(f"Training dataset: {X.shape[0]:,} rows x {X.shape[1]} features")
-    _log(f"Positive class (bought=1): {y.sum():,} ({y.mean()*100:.1f}%)")
-
-    if y.sum() < 100:
-        _log("Not enough positives to train — returning feature list only")
-        factor_df = pd.DataFrame({
-            "feature":     X_cols,
-            "group":       [get_group(c) for c in X_cols],
-            "description": [_desc(c) for c in X_cols],
-        })
-        return pd.DataFrame(), factor_df, 0.0
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
-    model = RandomForestClassifier(
-        n_estimators=100, max_depth=10, n_jobs=-1,
-        class_weight="balanced", random_state=42
-    )
-    _log("Training purchase propensity model...")
+def generate_replenishment_recs(
+    cp: pd.DataFrame, replenishment: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 9b: Generating replenishment recommendations (Phase 6)")
     t0 = time.time()
-    model.fit(X_tr, y_tr)
-    _log(f"Fit in {time.time()-t0:.1f}s")
 
-    auc = roc_auc_score(y_te, model.predict_proba(X_te)[:, 1])
-    _log(f"AUC-ROC: {auc:.4f}")
+    if len(replenishment) == 0:
+        _log("  No replenishment candidates available - skipping")
+        return pd.DataFrame()
 
-    report = classification_report(
-        y_te, model.predict(X_te),
-        target_names=["Will not buy", "Will buy"]
-    )
-    for line in report.strip().split("\n"):
-        _log(f"  {line}")
+    _log(f"  Input replenishment candidates: {len(replenishment):,}")
 
-    imp = pd.DataFrame({
-        "feature":    X_cols,
-        "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=False).reset_index(drop=True)
-    imp["rank"]         = range(1, len(imp)+1)
-    imp["importance"]   = imp["importance"].round(6)
-    imp["pct_of_total"] = (imp["importance"] / imp["importance"].sum() * 100).round(2)
-    imp["group"]        = imp["feature"].apply(get_group)
-
-    df_lbl = X.copy()
-    df_lbl["bought"] = y.values
-
-    rows = []
-    for _, r in imp.iterrows():
-        feat    = r["feature"]
-        col     = df_lbl[feat]
-        med     = col.median()
-        hi_rate = df_lbl.loc[col >= med, "bought"].mean() * 100
-        lo_rate = df_lbl.loc[col <  med, "bought"].mean() * 100
-        hi_rate = 0.0 if hi_rate != hi_rate else round(hi_rate, 1)
-        lo_rate = 0.0 if lo_rate != lo_rate else round(lo_rate, 1)
-        diff    = round(hi_rate - lo_rate, 1)
-        diff    = 0.0 if diff != diff else diff
-
-        rows.append({
-            "rank":          int(r["rank"]),
-            "group":         r["group"],
-            "feature":       feat,
-            "description":   _desc(feat),
-            "gini_pct":      r["pct_of_total"],
-            "buy_rate_high": hi_rate,
-            "buy_rate_low":  lo_rate,
-            "difference_pp": diff,
-            "what_it_means": _meaning(feat, hi_rate, lo_rate, diff, med),
-        })
-
-    factor_df = pd.DataFrame(rows)
-
-    _log(f"\n  {'RNK':<4} {'GRP':<12} {'FEATURE':<30} {'GINI%':>6} {'HI%':>6} {'LO%':>6} {'DIFF':>6}")
-    for _, r in factor_df.iterrows():
-        _log(
-            f"  {r['rank']:<4} {r['group']:<12} {r['feature']:<30} "
-            f"{r['gini_pct']:>6.1f} {r['buy_rate_high']:>6.1f} "
-            f"{r['buy_rate_low']:>6.1f} {r['difference_pp']:>+6.1f}"
-        )
-
-    _log("\n  Buy rate by feature group:")
-    for grp in ["PRODUCT", "INTERACTION", "CUSTOMER"]:
-        grp_rows = factor_df[factor_df["group"] == grp]
-        avg_imp = grp_rows["gini_pct"].sum()
-        _log(f"    {grp:<14} {avg_imp:>6.1f}% of total model importance")
-
-    return imp, factor_df, auc
-
-
-def _desc(feat: str) -> str:
-    d = {
-        "adoption_rate":             "% of peer group who buy this product",
-        "n_peer_groups_carrying":    "How many peer groups carry this product",
-        "is_private_brand":          "McKesson private brand flag",
-        "prod_family_encoded":       "Product family (encoded)",
-        "recency_days":              "Days since customer last ordered anything",
-        "frequency":                 "Customer total order count",
-        "monetary":                  "Customer total spend",
-        "avg_order_gap_days":        "Average days between customer orders",
-        "R_score":                   "Recency quintile 1-5",
-        "F_score":                   "Frequency quintile 1-5",
-        "M_score":                   "Monetary quintile 1-5",
-        "specialty_tier":            "Specialty tier 1-3",
-        "n_families_bought":         "Product families customer already buys from",
-        "already_buys_this_family":  "Customer already buys from this product family",
-        "adoption_x_recency":        "Adoption rate x recency score interaction",
-        "spend_in_family":           "Customer existing spend in this product family",
-        "pct_of_total_revenue":      "Specialty share of McKesson total revenue",
-        "specialty_revenue_trend_pct": "Specialty revenue trend FY2425->FY2526",
-    }
-    return d.get(feat, feat)
-
-
-def _meaning(feat: str, hi_rate: float, lo_rate: float,
-             diff: float, med: float) -> str:
-    if feat == "adoption_rate":
-        return (
-            f"Products bought by >= {med:.0%} of peers: {hi_rate:.0f}% buy rate. "
-            f"Below {med:.0%}: {lo_rate:.0f}% buy rate."
-        )
-    if feat == "already_buys_this_family":
-        return (
-            f"Buys this family: {hi_rate:.0f}% buy rate. "
-            f"Does not: {lo_rate:.0f}% buy rate."
-        )
-    if feat == "spend_in_family":
-        return (
-            f"Spend in family >= ${med:,.0f}: {hi_rate:.0f}% buy rate. "
-            f"No spend: {lo_rate:.0f}% buy rate."
-        )
-    if feat == "adoption_x_recency":
-        return (
-            f"High adoption x high recency: {hi_rate:.0f}% buy rate. "
-            f"Best pitch window."
-        )
-    direction = "above" if diff > 0 else "below"
-    return (
-        f"Customers {direction} median {feat}: {max(hi_rate, lo_rate):.0f}% buy rate. "
-        f"Difference of {abs(diff):.1f} percentage points."
-    )
-
-
-# Step 7: Save outputs
-
-def save_outputs(
-    recs_df:        pd.DataFrame,
-    adoption:       pd.DataFrame,
-    imp:            pd.DataFrame,
-    factor_signals: pd.DataFrame,
-    auc:            float,
-) -> None:
-    _s("Step 7: Saving outputs")
-
-    OUT_PRECOMP.mkdir(parents=True, exist_ok=True)
-    OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
-
-    recs_df = _normalise_recs_schema(recs_df)
-    recs_df = recs_df.sort_values(["cust_id", "rank"]).reset_index(drop=True)
-
-    recs_path = OUT_PRECOMP / "customer_recommendations.parquet"
-    recs_df.to_parquet(recs_path, index=False)
-    _log(f"Saved: {recs_path.relative_to(ROOT)}")
-
-    _write_recs_schema(recs_path.with_suffix(".schema.json"), recs_df)
-
-    adoption = _normalise_adoption_schema(adoption)
-    adop_path = OUT_PRECOMP / "product_adoption_rates.parquet"
-    adoption.to_parquet(adop_path, index=False)
-    _log(f"Saved: {adop_path.relative_to(ROOT)}")
-
-    if len(factor_signals) > 0:
-        fac_path = OUT_PRECOMP / "recommendation_factors.parquet"
-        factor_signals.to_parquet(fac_path, index=False)
-        _log(f"Saved: {fac_path.relative_to(ROOT)}")
-
-    CHART_N   = 20
-    xlsx_path = OUT_ANALYSIS / "recommendation_factors.xlsx"
-
-    family_adoption = (
-        adoption.groupby("prod_family")
-        .agg(
-            unique_products     = ("item_id",       "nunique"),
-            avg_adoption_rate   = ("adoption_rate", "mean"),
-            max_adoption_rate   = ("adoption_rate", "max"),
-            total_peer_buyers   = ("buyer_count",   "sum"),
-        )
-        .reset_index()
-        .sort_values("avg_adoption_rate", ascending=False)
-        .reset_index(drop=True)
-    )
-    family_adoption["avg_adoption_rate"] = family_adoption["avg_adoption_rate"].round(4)
-    family_adoption["max_adoption_rate"] = family_adoption["max_adoption_rate"].round(4)
-
-    top_products = (
-        adoption.groupby(["item_id", "item_dsc", "prod_family",
-                           "prod_category", "is_private_brand"])
-        .agg(
-            avg_adoption    = ("adoption_rate", "mean"),
-            peer_groups     = ("peer_group",    "nunique"),
-            total_buyers    = ("buyer_count",   "sum"),
-            median_spend    = ("median_spend",  "median"),
-        )
-        .reset_index()
-        .sort_values("avg_adoption", ascending=False)
-        .head(200)
-        .reset_index(drop=True)
-    )
-    top_products["avg_adoption"] = top_products["avg_adoption"].round(4)
-    top_products["median_spend"] = top_products["median_spend"].round(2)
-
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        family_adoption.to_excel(writer, sheet_name="01_family_adoption", index=False)
-        top_products.to_excel(   writer, sheet_name="02_top_products",    index=False)
-        if len(imp)            > 0: imp.to_excel(writer, sheet_name="03_factor_importance", index=False)
-        if len(factor_signals) > 0: factor_signals.to_excel(writer, sheet_name="04_factor_signals", index=False)
-        recs_df.head(5000).to_excel(writer, sheet_name="05_sample_recs", index=False)
-
-        wb = writer.book
-        colors = {
-            "01_family_adoption":   "1F4E79",
-            "02_top_products":      "375623",
-            "03_factor_importance": "7030A0",
-            "04_factor_signals":    "833C00",
-            "05_sample_recs":       "C00000",
-        }
-        dfs = {
-            "01_family_adoption":   family_adoption,
-            "02_top_products":      top_products,
-            "03_factor_importance": imp if len(imp) > 0 else pd.DataFrame(),
-            "04_factor_signals":    factor_signals if len(factor_signals) > 0 else pd.DataFrame(),
-            "05_sample_recs":       recs_df.head(5000),
-        }
-        for name, color in colors.items():
-            if name in wb.sheetnames and len(dfs[name]) > 0:
-                wb[name].sheet_properties.tabColor = color
-                _style(writer.sheets[name], dfs[name], hc=color)
-
-        if "01_family_adoption" in wb.sheetnames:
-            _chart(wb["01_family_adoption"], n=min(CHART_N, len(family_adoption)),
-                   lc=1, vc=3, anchor="I2",
-                   title="Avg product adoption rate by family",
-                   xtitle="Average adoption rate within peer groups",
-                   color="1F4E79")
-        if "02_top_products" in wb.sheetnames:
-            _chart(wb["02_top_products"], n=min(CHART_N, len(top_products)),
-                   lc=2, vc=6, anchor="L2",
-                   title=f"Top {CHART_N} products by avg adoption rate",
-                   xtitle="Avg adoption rate across peer groups",
-                   color="375623")
-        if "03_factor_importance" in wb.sheetnames and len(imp) > 0:
-            _chart(wb["03_factor_importance"], n=min(CHART_N, len(imp)),
-                   lc=1, vc=2, anchor="I2",
-                   title="Factors driving recommendation confidence",
-                   xtitle="Gini importance score", color="7030A0")
-
-    _log(f"Saved: {xlsx_path.relative_to(ROOT)}")
-
-    _save_pngs(family_adoption, imp, recs_df)
-
-
-def _normalise_recs_schema(recs_df: pd.DataFrame) -> pd.DataFrame:
-    df = recs_df.copy()
-
-    int_cols   = ["cust_id", "item_id", "is_private_brand", "rank",
-                  "peer_group_size", "buyer_count"]
-    float_cols = ["score", "adoption_rate", "median_peer_spend"]
-    text_cols  = ["item_dsc", "prod_family", "prod_category", "signal",
-                  "segment", "supplier_profile", "pitch_message"]
-
-    for c in int_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
-    for c in float_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype("float64")
-    for c in text_cols:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str)
-
-    col_order = [
-        "cust_id", "rank", "segment", "supplier_profile",
-        "item_id", "item_dsc", "prod_family", "prod_category",
-        "is_private_brand", "signal", "score",
-        "adoption_rate", "peer_group_size", "buyer_count", "median_peer_spend",
-        "pitch_message",
+    # Keep only the columns we need from the precomputed file
+    needed_cols = [
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID",
+        "days_since_last", "median_days_between_segment",
+        "overdue_ratio", "peer_activity_rate", "n_buyers_segment",
     ]
-    ordered = [c for c in col_order if c in df.columns]
-    remaining = [c for c in df.columns if c not in ordered]
-    df = df[ordered + remaining]
+    keep_cols = [c for c in needed_cols if c in replenishment.columns]
+    repl = replenishment[keep_cols].copy()
 
-    return df
+    # Make sure required columns exist; if not, bail gracefully
+    if "overdue_ratio" not in repl.columns:
+        _log("  WARNING: overdue_ratio column missing - skipping replenishment")
+        return pd.DataFrame()
+    if "peer_activity_rate" not in repl.columns:
+        repl["peer_activity_rate"] = 0.5  # neutral fallback
+    if "median_days_between_segment" not in repl.columns:
+        repl["median_days_between_segment"] = np.nan
+    if "days_since_last" not in repl.columns:
+        repl["days_since_last"] = -1
+
+    # Slim products and specialty for the merge
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
+
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
+
+    cust_profile_slim = cp[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
+
+    # Merge in everything we need
+    candidates = repl.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+    n_after_cust = len(candidates)
+    candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
+    n_after_prod = len(candidates)
+    _log(f"  After cust merge: {n_after_cust:,}")
+    _log(f"  After product merge (drops products outside eligible pool): {n_after_prod:,}")
+
+    if len(candidates) == 0:
+        _log("  No candidates after merges - skipping")
+        return pd.DataFrame()
+
+    # Apply standard filters. NOTE: NO apply_already_buys_filter - replenishment
+    # is intentionally for products the customer already buys.
+    candidates = apply_affordability_filter(candidates)
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    candidates = apply_specialty_scoring(candidates, spec_slim)
+
+    # Scoring
+    # Cap overdue_ratio so a 365x outlier doesn't dominate. A 5x clip means
+    # anything beyond "5x past expected reorder" gets the same numeric_score
+    # contribution from overdueness - so a clean 2x candidate doesn't lose
+    # to noise.
+    overdue_clipped = candidates["overdue_ratio"].clip(upper=REPLENISHMENT_OVERDUE_CAP).astype("float32")
+    overdue_score = np.log1p(overdue_clipped)
+
+    # peer confidence: how many peers still buying it (0-1)
+    peer_conf = candidates["peer_activity_rate"].clip(lower=0.0, upper=1.0).astype("float32")
+
+    candidates["base_score"] = (
+        overdue_score * (1.0 + peer_conf) * 3.0 *
+        candidates["specialty_multiplier"]
+    ).astype("float32")
+    candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.3
+    # Declining/churned customers are the prime replenishment audience
+    candidates["declining_boost"] = (
+        candidates["is_declining"] * 0.5 + candidates["is_churned"] * 0.7
+    ).astype("float32")
+    candidates["numeric_score"] = (
+        candidates["base_score"] + candidates["pb_boost"] +
+        candidates["declining_boost"] + BOOST_REPLENISHMENT
+    ).astype("float32")
+
+    candidates["primary_signal"]    = "replenishment"
+    candidates["peer_adoption_rate"] = peer_conf  # reuse this column for tracking
+    # Confidence: high when peers are very active AND overdue is in a
+    # believable range (1.5x to 3x). Low when specialty mismatches.
+    is_clean_overdue = (
+        (candidates["overdue_ratio"] >= 1.5) & (candidates["overdue_ratio"] <= 3.0)
+    )
+    is_strong_peers = candidates["peer_activity_rate"] >= 0.5
+    candidates["confidence_tier"] = np.where(
+        is_clean_overdue & is_strong_peers, "high",
+        np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
+    )
+
+    candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+        "numeric_score"
+    ].rank(method="first", ascending=False)
+    candidates = candidates[candidates["rank"] <= REPLENISHMENT_TOP_N_PER_CUST].copy()
+    candidates["rank"] = candidates["rank"].astype("int8")
+
+    _log(f"  Final replenishment recs: {len(candidates):,}")
+    _log(f"  Customers covered       : {candidates['DIM_CUST_CURR_ID'].nunique():,}")
+    if len(candidates) > 0:
+        _log(f"  Score stats: min={candidates['numeric_score'].min():.2f}  "
+             f"median={candidates['numeric_score'].median():.2f}  "
+             f"max={candidates['numeric_score'].max():.2f}")
+        _log(f"  Overdue stats (in selected): "
+             f"p10={candidates['overdue_ratio'].quantile(0.10):.2f}x  "
+             f"median={candidates['overdue_ratio'].quantile(0.50):.2f}x  "
+             f"p90={candidates['overdue_ratio'].quantile(0.90):.2f}x")
+    _log(f"Step 9b done in {time.time()-t0:.1f}s")
+    return candidates
 
 
-def _normalise_adoption_schema(adoption: pd.DataFrame) -> pd.DataFrame:
-    df = adoption.copy()
-    for c in ["item_id", "buyer_count", "total_orders", "peer_group_size",
-              "is_private_brand"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
-    for c in ["median_spend", "total_spend", "adoption_rate"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype("float64")
-    for c in ["peer_group", "item_dsc", "prod_family", "prod_category"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str)
-    return df
+# Step 10: Medline conversion
+
+def generate_medline_conversion_recs(
+    cp: pd.DataFrame, pb_equiv: pd.DataFrame, history: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 10: Generating Medline conversion recommendations")
+    t0 = time.time()
+
+    medline = pb_equiv[pb_equiv["match_type"] == "medline_conversion"].copy()
+
+    # Drop price anomalies (Phase 4 fix - prevents implausible price drops)
+    n_before = len(medline)
+    if "price_anomaly" in medline.columns:
+        medline = medline[medline["price_anomaly"].fillna(0) == 0]
+        _log(f"  Medline pairs after dropping price anomalies: {len(medline):,} (dropped {n_before - len(medline):,})")
+    else:
+        _log(f"  Medline pairs: {len(medline):,}")
+
+    if len(medline) == 0:
+        return pd.DataFrame()
+
+    medline_orig_items = set(medline["original_item_id"].unique())
+    medline_buyers = history[history["DIM_ITEM_E1_CURR_ID"].isin(medline_orig_items)][[
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"
+    ]].rename(columns={"DIM_ITEM_E1_CURR_ID": "original_item_id"})
+    _log(f"  Customer-Medline pairs: {len(medline_buyers):,}")
+
+    candidates = medline_buyers.merge(medline, on="original_item_id", how="inner")
+    candidates = candidates.rename(columns={"equivalent_item_id": "DIM_ITEM_E1_CURR_ID"})
+
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
+
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
+
+    cust_profile_slim = cp[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
+
+    candidates = candidates.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+    candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
+    candidates = apply_affordability_filter(candidates)
+    candidates = apply_already_buys_filter(candidates, history)
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    candidates = apply_specialty_scoring(candidates, spec_slim)
+
+    candidates["base_score"] = (3.0 * candidates["specialty_multiplier"]).astype("float32")
+    candidates["pb_boost"] = candidates["is_private_brand"].fillna(0) * 0.3
+    candidates["declining_boost"] = candidates["is_declining"] * 0.2
+    candidates["numeric_score"] = (
+        candidates["base_score"] + candidates["pb_boost"] +
+        candidates["declining_boost"] + BOOST_MEDLINE_CONVERSION
+    ).astype("float32")
+
+    candidates["primary_signal"]    = "medline_conversion"
+    candidates["peer_adoption_rate"] = 0.0
+    candidates["confidence_tier"] = "high"
+
+    candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+        "numeric_score"
+    ].rank(method="first", ascending=False)
+    candidates = candidates[candidates["rank"] <= 5].copy()
+    candidates["rank"] = candidates["rank"].astype("int8")
+
+    _log(f"  Final Medline recs: {len(candidates):,}")
+    _log(f"  Customers covered : {candidates['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"Step 10 done in {time.time()-t0:.1f}s")
+    return candidates
 
 
-def _write_recs_schema(path: Path, df: pd.DataFrame) -> None:
-    schema = {
-        "file":    "customer_recommendations.parquet",
-        "purpose": "Precomputed top-N recommendations per customer. Read by the API.",
-        "sort_order": ["cust_id", "rank"],
-        "row_count":  int(len(df)),
-        "columns": [],
-    }
-    col_meta = {
-        "cust_id":          ("int64",  "Customer ID — joins to customers_clean"),
-        "rank":             ("int64",  "1-indexed rank within customer. 1 = top pick."),
-        "segment":          ("string", "MKT_CD_tier label (e.g. PO_high). 'unknown' if missing."),
-        "supplier_profile": ("string", "One of: medline_only, mckesson_primary, mixed."),
-        "item_id":          ("int64",  "Product ID — joins to products_clean"),
-        "item_dsc":         ("string", "Human-readable product name"),
-        "prod_family":      ("string", "PROD_FMLY_LVL1_DSC"),
-        "prod_category":    ("string", "PROD_CTGRY_LVL2_DSC"),
-        "is_private_brand": ("int64",  "1 if McKesson private brand, else 0"),
-        "signal":           ("string", "'peer_gap' or 'lapsed'"),
-        "score":            ("float64","Final scoring value — higher ranks first"),
-        "adoption_rate":    ("float64","Peer adoption rate for peer_gap signal (0 for lapsed)"),
-        "peer_group_size":  ("int64",  "Size of the peer group the rate was computed over"),
-        "buyer_count":      ("int64",  "Number of peers who bought this item"),
-        "median_peer_spend":("float64","Median spend per order among peers who buy"),
-        "pitch_message":    ("string", "Seller-facing pitch text."),
-    }
-    for c in df.columns:
-        dtype, desc = col_meta.get(c, (str(df[c].dtype), ""))
-        schema["columns"].append({"name": c, "type": dtype, "description": desc})
+# Step 11: Private brand upgrade
+# Phase 5 fix: score now scales with absolute dollar savings, not just % savings.
+# Old formula: (savings_pct * 5 + 1) * specialty_multiplier
+#   -> 26% savings on $2 tape and 26% savings on $50 catheter scored identically.
+# New formula: (savings_pct * 5 + 1) * dollar_factor * specialty_multiplier
+#   where dollar_factor = log1p(abs_savings_dollars) clipped to a sensible range.
+# This pushes high-dollar-impact PB upgrades up the ranker without breaking
+# within-signal ordering for low-savings cases.
 
-    path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
-    _log(f"Saved: {path.relative_to(ROOT)}")
+def generate_pb_upgrade_recs(
+    cp: pd.DataFrame, pb_equiv: pd.DataFrame, history: pd.DataFrame,
+    products: pd.DataFrame, specialty: pd.DataFrame,
+) -> pd.DataFrame:
+    _s("Step 11: Generating private brand upgrade recommendations")
+    t0 = time.time()
+
+    pb_upgrade = pb_equiv[pb_equiv["match_type"] == "private_brand_upgrade"].copy()
+
+    # Drop price anomalies
+    n_before = len(pb_upgrade)
+    if "price_anomaly" in pb_upgrade.columns:
+        pb_upgrade = pb_upgrade[pb_upgrade["price_anomaly"].fillna(0) == 0]
+        _log(f"  PB upgrade pairs after dropping price anomalies: {len(pb_upgrade):,} (dropped {n_before - len(pb_upgrade):,})")
+    else:
+        _log(f"  PB upgrade pairs: {len(pb_upgrade):,}")
+
+    if len(pb_upgrade) == 0:
+        return pd.DataFrame()
+
+    pb_orig_items = set(pb_upgrade["original_item_id"].unique())
+    pb_buyers = history[history["DIM_ITEM_E1_CURR_ID"].isin(pb_orig_items)][[
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"
+    ]].rename(columns={"DIM_ITEM_E1_CURR_ID": "original_item_id"})
+    _log(f"  Customer-NationalBrand pairs: {len(pb_buyers):,}")
+
+    candidates = pb_buyers.merge(pb_upgrade, on="original_item_id", how="inner")
+    candidates = candidates.rename(columns={"equivalent_item_id": "DIM_ITEM_E1_CURR_ID"})
+
+    products_slim = products[[
+        "DIM_ITEM_E1_CURR_ID", "ITEM_DSC", "PROD_FMLY_LVL1_DSC",
+        "PROD_CTGRY_LVL2_DSC", "n_buyers", "median_unit_price",
+        "median_purchases_per_buyer_per_year", "buyer_affordability_p10",
+        "is_private_brand", "primary_market", "primary_market_pct",
+    ]].copy()
+
+    spec_slim = specialty[[
+        "DIM_ITEM_E1_CURR_ID",
+        "top_specialty_1", "top_specialty_2", "top_specialty_3",
+        "top_specialty_4", "top_specialty_5", "specialty_hhi",
+    ]].copy()
+
+    cust_profile_slim = cp[[
+        "DIM_CUST_CURR_ID", "segment", "size_tier", "mkt_cd_clean",
+        "affordability_ceiling", "SPCLTY_CD", "order_cadence_tier",
+        "is_declining", "is_churned", "n_unique_products_total",
+    ]]
+
+    candidates = candidates.merge(cust_profile_slim, on="DIM_CUST_CURR_ID", how="inner")
+    candidates = candidates.merge(products_slim, on="DIM_ITEM_E1_CURR_ID", how="inner")
+    candidates = apply_affordability_filter(candidates)
+    candidates = apply_already_buys_filter(candidates, history)
+    if len(candidates) == 0:
+        return pd.DataFrame()
+
+    candidates = apply_specialty_scoring(candidates, spec_slim)
+
+    # Percent savings (existing logic)
+    if "price_delta_pct" in candidates.columns:
+        savings = candidates["price_delta_pct"].fillna(0).astype("float32") * -1
+        candidates["savings_score"] = savings.clip(lower=0)
+    else:
+        candidates["savings_score"] = pd.Series(0.10, index=candidates.index, dtype="float32")
+
+    # Phase 5: absolute dollar savings factor.
+    # Compute from original_unit_price - equivalent_unit_price when available.
+    # Fall back to median_unit_price * savings_score for older equivalent files.
+    if (
+        "original_unit_price" in candidates.columns
+        and "equivalent_unit_price" in candidates.columns
+    ):
+        abs_savings = (
+            candidates["original_unit_price"].fillna(0).astype("float32") -
+            candidates["equivalent_unit_price"].fillna(0).astype("float32")
+        ).clip(lower=0)
+    else:
+        # Fallback: estimate from the equivalent's median price and the savings %.
+        # If equiv price = X and savings pct = s, then original = X / (1 - s),
+        # so abs_savings = X * s / (1 - s). Clip s to avoid divide-by-zero.
+        s_clipped = candidates["savings_score"].clip(upper=0.95)
+        eq_price = candidates["median_unit_price"].fillna(0).astype("float32")
+        abs_savings = (eq_price * s_clipped / (1.0 - s_clipped).clip(lower=0.05)).clip(lower=0)
+
+    # log1p smooths high outliers; clip at 50 (~$50 savings) so a $500 catheter
+    # doesn't completely dominate the ranker.
+    candidates["dollar_factor"] = np.log1p(abs_savings.clip(upper=50.0)).astype("float32")
+
+    candidates["base_score"] = (
+        (candidates["savings_score"] * 5.0 + 1.0) *
+        (1.0 + candidates["dollar_factor"]) *
+        candidates["specialty_multiplier"]
+    ).astype("float32")
+    candidates["pb_boost"] = 0.5
+    candidates["declining_boost"] = candidates["is_declining"] * 0.2
+    candidates["numeric_score"] = (
+        candidates["base_score"] + candidates["pb_boost"] +
+        candidates["declining_boost"] + BOOST_PB_UPGRADE
+    ).astype("float32")
+
+    candidates["primary_signal"]    = "private_brand_upgrade"
+    candidates["peer_adoption_rate"] = 0.0
+    candidates["confidence_tier"] = np.where(
+        candidates["savings_score"] >= 0.20, "high",
+        np.where(candidates["specialty_match"] == "mismatch", "low", "medium")
+    )
+
+    candidates["rank"] = candidates.groupby("DIM_CUST_CURR_ID")[
+        "numeric_score"
+    ].rank(method="first", ascending=False)
+    candidates = candidates[candidates["rank"] <= 5].copy()
+    candidates["rank"] = candidates["rank"].astype("int8")
+
+    _log(f"  Final PB upgrade recs: {len(candidates):,}")
+    _log(f"  Customers covered    : {candidates['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"  Score stats: min={candidates['numeric_score'].min():.2f}  "
+         f"median={candidates['numeric_score'].median():.2f}  "
+         f"max={candidates['numeric_score'].max():.2f}")
+    _log(f"Step 11 done in {time.time()-t0:.1f}s")
+    return candidates
 
 
-def _save_pngs(
-    family_adoption: pd.DataFrame,
-    imp:             pd.DataFrame,
-    recs_df:         pd.DataFrame,
-) -> None:
-    if len(family_adoption) > 0:
-        top = family_adoption.head(15).iloc[::-1]
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.barh(top["prod_family"].astype(str).str[:35],
-                top["avg_adoption_rate"] * 100, color="#1F4E79")
-        ax.set_xlabel("Average adoption rate within peer groups (%)")
-        ax.set_title("Product family adoption rates (top 15)")
-        plt.tight_layout()
-        out = OUT_ANALYSIS / "recommendation_family_adoption.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        _log(f"Saved: {out.relative_to(ROOT)}")
+# Step 12: Combine + diversification (Phase 3 + Phase 5 + Phase 6 fixes)
+# Phase 5 changes:
+#   1. Score normalization: rank-percentile within each signal type before
+#      cross-signal comparison. Stops popularity (median ~60) from drowning
+#      peer_gap (median ~10) in the final ranker.
+#   2. Specialty mismatch filter: for customers with >= 10 history products,
+#      drop "mismatch" recs. Cold-start customers are exempt (they need
+#      broad recommendations, not narrow specialty fits).
+# Phase 6 changes:
+#   3. Replenishment signal added with quota=3, plus appears in BACKFILL_ORDER.
 
-    if len(imp) > 0:
-        top = imp.head(15).iloc[::-1]
-        colors = {"PRODUCT": "#1F4E79", "CUSTOMER": "#375623",
-                  "INTERACTION": "#7030A0", "OTHER": "#888888"}
-        fig, ax = plt.subplots(figsize=(10, 6))
-        bar_colors = [colors.get(g, "#888888") for g in top["group"]]
-        ax.barh(top["feature"], top["pct_of_total"], color=bar_colors)
-        ax.set_xlabel("% of total model importance (Gini)")
-        ax.set_title("Top 15 factors driving recommendation confidence")
-        import matplotlib.patches as mpatches
-        legend_handles = [mpatches.Patch(color=c, label=g)
-                           for g, c in colors.items() if g != "OTHER"]
-        ax.legend(handles=legend_handles, loc="lower right")
-        plt.tight_layout()
-        out = OUT_ANALYSIS / "recommendation_factor_importance.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        _log(f"Saved: {out.relative_to(ROOT)}")
+def diversified_combine(rec_dfs: list) -> pd.DataFrame:
+    _s("Step 12: Combining with diversification quotas (Phase 3 + Phase 5 + Phase 6)")
+    t0 = time.time()
 
-    if len(recs_df) > 0 and "segment" in recs_df.columns:
-        rank1 = recs_df[recs_df["rank"] == 1]
-        if len(rank1) > 0:
-            mix = (
-                rank1.groupby(["segment", "signal"])
-                .size()
-                .unstack(fill_value=0)
-            )
-            if "peer_gap" not in mix.columns: mix["peer_gap"] = 0
-            if "lapsed"   not in mix.columns: mix["lapsed"]   = 0
-            mix["total"] = mix["peer_gap"] + mix["lapsed"]
-            mix = mix[mix["total"] >= 100].copy()
-            if len(mix) > 0:
-                mix["peer_gap_pct"] = mix["peer_gap"] / mix["total"] * 100
-                mix["lapsed_pct"]   = mix["lapsed"]   / mix["total"] * 100
-                mix = mix.sort_values("peer_gap_pct", ascending=True)
+    common_cols = [
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID", "ITEM_DSC",
+        "PROD_FMLY_LVL1_DSC", "PROD_CTGRY_LVL2_DSC",
+        "primary_signal", "confidence_tier",
+        "numeric_score", "peer_adoption_rate",
+        "specialty_match", "n_buyers",
+        "median_unit_price", "median_purchases_per_buyer_per_year",
+        "is_private_brand", "primary_market", "primary_market_pct",
+        "segment", "size_tier", "mkt_cd_clean", "SPCLTY_CD",
+        "is_declining", "is_churned", "order_cadence_tier",
+        "n_unique_products_total",
+    ]
 
-                fig, ax = plt.subplots(figsize=(10, 7))
-                y = range(len(mix))
-                ax.barh(y, mix["peer_gap_pct"], color="#1F4E79", label="peer_gap")
-                ax.barh(y, mix["lapsed_pct"], left=mix["peer_gap_pct"],
-                        color="#C00000", label="lapsed")
-                ax.set_yticks(y)
-                ax.set_yticklabels(mix.index)
-                ax.set_xlabel("% of rank-1 recommendations")
-                ax.set_xlim(0, 100)
-                ax.set_title("Signal mix by segment at rank 1")
-                ax.legend(loc="lower right")
-                plt.tight_layout()
-                out = OUT_ANALYSIS / "recommendation_signal_mix_by_segment.png"
-                plt.savefig(out, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                _log(f"Saved: {out.relative_to(ROOT)}")
+    aligned_dfs = []
+    for df in rec_dfs:
+        if len(df) == 0:
+            continue
+        cols_present = [c for c in common_cols if c in df.columns]
+        aligned_dfs.append(df[cols_present].copy())
+
+    combined = pd.concat(aligned_dfs, ignore_index=True)
+    _log(f"  Combined candidates: {len(combined):,}")
+
+    # ---- Phase 5 fix #2: specialty mismatch filter (before dedup so we don't
+    # accidentally promote a mismatch rec by virtue of it appearing in 2 signals) ----
+    if "n_unique_products_total" in combined.columns and "specialty_match" in combined.columns:
+        n_before = len(combined)
+        has_history = combined["n_unique_products_total"].fillna(0) >= SPECIALTY_FILTER_MIN_HISTORY
+        is_mismatch = combined["specialty_match"] == "mismatch"
+        # Drop only when BOTH conditions hold: customer has real history AND rec is a mismatch.
+        combined = combined[~(has_history & is_mismatch)].copy()
+        n_dropped = n_before - len(combined)
+        _log(f"  Phase 5 specialty filter: dropped {n_dropped:,} mismatch recs "
+             f"for customers with >= {SPECIALTY_FILTER_MIN_HISTORY} history products")
+
+    # Dedup: if the same (customer, product) appears across multiple signals,
+    # keep the highest-raw-score copy. We do this before normalization so the
+    # normalization buckets are clean.
+    combined = combined.sort_values("numeric_score", ascending=False)
+    combined = combined.drop_duplicates(
+        subset=["DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"], keep="first"
+    )
+    _log(f"  After deduplication: {len(combined):,}")
+
+    # ---- Phase 5 fix #1: per-signal score normalization ----
+    # Compute a 0-1 percentile rank within each signal type. This becomes the
+    # primary cross-signal comparison key. We keep numeric_score as well so
+    # downstream consumers can still see the raw value and the within-signal
+    # ordering is preserved (rank-percentile is monotonic in numeric_score).
+    _log(f"")
+    _log(f"  Normalizing scores per signal (rank-percentile within signal):")
+    combined[NORMALIZED_SCORE_COL] = (
+        combined.groupby("primary_signal")["numeric_score"]
+        .rank(method="average", pct=True)
+        .astype("float32")
+    )
+    norm_stats = combined.groupby("primary_signal").agg(
+        raw_median=("numeric_score", "median"),
+        norm_median=(NORMALIZED_SCORE_COL, "median"),
+        n=("numeric_score", "size"),
+    ).round(3)
+    for sig, row in norm_stats.iterrows():
+        _log(f"    {sig:<22}  n={int(row['n']):>10,}  "
+             f"raw_med={row['raw_median']:>7.2f}  norm_med={row['norm_median']:.3f}")
+
+    _log(f"")
+    _log(f"  Candidate distribution (BEFORE quota selection):")
+    for sig, n in combined["primary_signal"].value_counts().items():
+        _log(f"    {sig:<22}  {n:>10,}")
+
+    _log(f"")
+    _log(f"  Applying diversification quotas (max per type):")
+    for sig, quota in QUOTAS.items():
+        _log(f"    {sig:<22}  {quota}")
+
+    # Within-signal rank uses RAW score (preserves your tuned within-signal ordering)
+    combined["within_signal_rank"] = combined.groupby(
+        ["DIM_CUST_CURR_ID", "primary_signal"]
+    )["numeric_score"].rank(method="first", ascending=False)
+
+    combined["quota_max"] = combined["primary_signal"].map(QUOTAS).fillna(2).astype("int8")
+    after_quota = combined[combined["within_signal_rank"] <= combined["quota_max"]].copy()
+    _log(f"  After quota selection: {len(after_quota):,}")
+
+    _log(f"")
+    _log(f"  Distribution after quota selection:")
+    for sig, n in after_quota["primary_signal"].value_counts().items():
+        _log(f"    {sig:<22}  {n:>10,}")
+
+    # Cross-signal final rank uses NORMALIZED score so popularity can't dominate
+    after_quota["rank"] = after_quota.groupby("DIM_CUST_CURR_ID")[
+        NORMALIZED_SCORE_COL
+    ].rank(method="first", ascending=False)
+    selected = after_quota[after_quota["rank"] <= TOP_N_RECS].copy()
+
+    counts_per_cust = selected.groupby("DIM_CUST_CURR_ID").size()
+    underfilled_custs = counts_per_cust[counts_per_cust < TOP_N_RECS].index.tolist()
+
+    if underfilled_custs:
+        _log(f"")
+        _log(f"  Underfilled customers (< {TOP_N_RECS} recs): {len(underfilled_custs):,}")
+        _log(f"  Backfilling from: {BACKFILL_ORDER}")
+
+        already_selected = selected[["DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"]].copy()
+        already_selected["selected"] = 1
+
+        backfill_pool = combined[combined["DIM_CUST_CURR_ID"].isin(underfilled_custs)].copy()
+        backfill_pool = backfill_pool.merge(
+            already_selected,
+            on=["DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID"], how="left"
+        )
+        backfill_pool = backfill_pool[backfill_pool["selected"].isna()].copy()
+        backfill_pool = backfill_pool.drop(columns=["selected"])
+
+        backfill_pool = backfill_pool[backfill_pool["primary_signal"].isin(BACKFILL_ORDER)]
+
+        slots_needed = TOP_N_RECS - counts_per_cust
+        slots_needed = slots_needed[slots_needed > 0]
+
+        # Backfill rank also uses normalized score for consistency
+        backfill_pool["backfill_rank"] = backfill_pool.groupby("DIM_CUST_CURR_ID")[
+            NORMALIZED_SCORE_COL
+        ].rank(method="first", ascending=False)
+
+        backfill_pool = backfill_pool.merge(
+            slots_needed.rename("slots").reset_index(),
+            on="DIM_CUST_CURR_ID", how="left"
+        )
+        backfill_chosen = backfill_pool[
+            backfill_pool["backfill_rank"] <= backfill_pool["slots"]
+        ].drop(columns=["backfill_rank", "slots"])
+
+        _log(f"  Backfilled recs added: {len(backfill_chosen):,}")
+
+        selected = pd.concat([selected, backfill_chosen], ignore_index=True)
+
+        # Re-rank using normalized score after merge
+        selected["rank"] = selected.groupby("DIM_CUST_CURR_ID")[
+            NORMALIZED_SCORE_COL
+        ].rank(method="first", ascending=False)
+        selected = selected[selected["rank"] <= TOP_N_RECS].copy()
+
+    selected["rank"] = selected["rank"].astype("int8")
+
+    drop_cols = ["within_signal_rank", "quota_max"]
+    selected = selected.drop(columns=[c for c in drop_cols if c in selected.columns])
+
+    _log(f"")
+    _log(f"  Final top-{TOP_N_RECS} per customer: {len(selected):,}")
+    _log(f"  Unique customers: {selected['DIM_CUST_CURR_ID'].nunique():,}")
+    _log(f"")
+    _log(f"  Final signal distribution:")
+    for sig, n in selected["primary_signal"].value_counts().items():
+        pct = n / len(selected) * 100
+        _log(f"    {sig:<22}  {n:>10,} ({pct:.1f}%)")
+
+    _log(f"Step 12 done in {time.time()-t0:.1f}s")
+    return selected
+
+
+# Step 13: Add rec_purpose tags (Phase 4)
+
+def add_rec_purpose(recs: pd.DataFrame) -> pd.DataFrame:
+    _s("Step 13: Tagging rec_purpose for business clarity (Phase 4)")
+    t0 = time.time()
+
+    recs["rec_purpose"] = recs["primary_signal"].map(SIGNAL_TO_PURPOSE).fillna("other")
+    recs["is_mckesson_brand"] = recs["is_private_brand"].fillna(0).astype("int8")
+
+    _log(f"  Distribution by rec_purpose:")
+    for purp, n in recs["rec_purpose"].value_counts().items():
+        pct = n / len(recs) * 100
+        _log(f"    {purp:<22}  {n:>10,} ({pct:.1f}%)")
+
+    _log(f"")
+    _log(f"  McKesson Brand penetration:")
+    n_mck = int(recs["is_mckesson_brand"].sum())
+    pct_mck = n_mck / len(recs) * 100
+    _log(f"    Total McKesson Brand recs: {n_mck:,} ({pct_mck:.1f}%)")
+    _log(f"")
+    _log(f"  McKesson Brand by signal type:")
+    by_sig = recs.groupby("primary_signal").agg(
+        total=("DIM_ITEM_E1_CURR_ID", "count"),
+        mck_count=("is_mckesson_brand", "sum"),
+    )
+    by_sig["mck_pct"] = (by_sig["mck_count"] / by_sig["total"] * 100).round(1)
+    for sig, row in by_sig.iterrows():
+        _log(f"    {sig:<22}  {int(row['mck_count']):>8,}/{int(row['total']):<8,}  ({row['mck_pct']:.1f}%)")
+
+    _log(f"")
+    _log(f"Step 13 done in {time.time()-t0:.1f}s")
+    return recs
+
+
+# Step 14: Pitch reasons
+
+def add_pitch_reasons(recs: pd.DataFrame) -> pd.DataFrame:
+    _s("Step 14: Generating pitch reasons")
+    t0 = time.time()
+
+    family_short = recs["PROD_FMLY_LVL1_DSC"].fillna("").astype(str).str[:30]
+    seg_str      = recs["segment"].fillna("").astype(str)
+    adoption_pct = (recs["peer_adoption_rate"].fillna(0) * 100).round(0).astype(int)
+    n_buyers_str = recs.get("n_buyers", pd.Series(0, index=recs.index)).fillna(0).astype(int).map(lambda x: f"{x:,}")
+
+    is_peer    = recs["primary_signal"] == "peer_gap"
+    is_pop     = recs["primary_signal"] == "popularity"
+    is_cart    = recs["primary_signal"] == "cart_complement"
+    is_sim     = recs["primary_signal"] == "item_similarity"
+    is_lapsed  = recs["primary_signal"] == "lapsed_recovery"
+    is_repl    = recs["primary_signal"] == "replenishment"   # Phase 6
+    is_medline = recs["primary_signal"] == "medline_conversion"
+    is_pb      = recs["primary_signal"] == "private_brand_upgrade"
+
+    peer_reason = (
+        adoption_pct.astype(str) + "% of " + seg_str + " peers buy " +
+        family_short + " products. You don't currently."
+    )
+    pop_reason = (
+        "Popular among " + seg_str + " peers (" + n_buyers_str +
+        " buyers). A safe starting point while we learn your patterns."
+    )
+    cart_reason = (
+        "Customers who buy your products also buy this. Common pairing in " + family_short + "."
+    )
+    sim_reason = (
+        "Similar to products you already buy. Customers like you tend to use this " + family_short + " item."
+    )
+    lapsed_reason = (
+        "You bought this before but not in 6+ months. Win-back opportunity in " + family_short + "."
+    )
+    # Phase 6: replenishment pitch
+    # If we have peer_adoption_rate (which we reused for peer_activity_rate
+    # in this signal), surface it - sellers love seeing peer evidence.
+    peer_pct_str = adoption_pct.astype(str) + "%"
+    repl_reason = (
+        "You usually order this but haven't recently. " + peer_pct_str +
+        " of peers in your segment still order it on a regular cadence. Likely due for reorder."
+    )
+    medline_reason = (
+        "You currently buy a Medline product. McKesson alternative in " + family_short + " offers comparable function."
+    )
+    pb_reason_str = (
+        "McKesson Brand alternative to a national brand you buy. Same form, same category, often cheaper."
+    )
+
+    recs["pitch_reason"] = ""
+    recs.loc[is_peer,    "pitch_reason"] = peer_reason[is_peer]
+    recs.loc[is_pop,     "pitch_reason"] = pop_reason[is_pop]
+    recs.loc[is_cart,    "pitch_reason"] = cart_reason[is_cart]
+    recs.loc[is_sim,     "pitch_reason"] = sim_reason[is_sim]
+    recs.loc[is_lapsed,  "pitch_reason"] = lapsed_reason[is_lapsed]
+    recs.loc[is_repl,    "pitch_reason"] = repl_reason[is_repl]   # Phase 6
+    recs.loc[is_medline, "pitch_reason"] = medline_reason[is_medline]
+    recs.loc[is_pb,      "pitch_reason"] = pb_reason_str
+
+    is_match    = recs.get("specialty_match", pd.Series("", index=recs.index)) == "match"
+    is_mismatch = recs.get("specialty_match", pd.Series("", index=recs.index)) == "mismatch"
+    spclty      = recs.get("SPCLTY_CD", pd.Series("", index=recs.index)).fillna("").astype(str)
+
+    recs.loc[is_match, "pitch_reason"] = (
+        recs.loc[is_match, "pitch_reason"] +
+        " Aligns with your specialty (" + spclty[is_match] + ")."
+    )
+    recs.loc[is_mismatch, "pitch_reason"] = (
+        recs.loc[is_mismatch, "pitch_reason"] +
+        " (Note: may not fit your specialty)"
+    )
+
+    recs["pitch_reason"] = recs["pitch_reason"].replace("", "Recommended product.")
+
+    _log(f"Generated {len(recs):,} pitch reasons in {time.time()-t0:.1f}s")
+    return recs
+
+
+# Step 15: Save
+
+def save_recommendations(recs: pd.DataFrame) -> pd.DataFrame:
+    _s("Step 15: Saving recommendations")
+    t0 = time.time()
+
+    output_cols = [
+        "DIM_CUST_CURR_ID", "DIM_ITEM_E1_CURR_ID", "ITEM_DSC",
+        "PROD_FMLY_LVL1_DSC", "PROD_CTGRY_LVL2_DSC",
+        "rank", "primary_signal", "rec_purpose", "is_mckesson_brand",
+        "pitch_reason", "confidence_tier", "numeric_score",
+        NORMALIZED_SCORE_COL,
+        "peer_adoption_rate", "specialty_match",
+        "median_unit_price", "median_purchases_per_buyer_per_year",
+        "is_private_brand",
+        "segment", "size_tier", "mkt_cd_clean", "SPCLTY_CD",
+        "is_declining", "is_churned", "order_cadence_tier",
+    ]
+    output_cols = [c for c in output_cols if c in recs.columns]
+    recs = recs[output_cols].copy()
+
+    recs["DIM_CUST_CURR_ID"]   = recs["DIM_CUST_CURR_ID"].astype("int64")
+    recs["DIM_ITEM_E1_CURR_ID"] = recs["DIM_ITEM_E1_CURR_ID"].astype("int64")
+    recs["rank"]               = recs["rank"].astype("int8")
+    recs["numeric_score"]      = recs["numeric_score"].astype("float32")
+    if NORMALIZED_SCORE_COL in recs.columns:
+        recs[NORMALIZED_SCORE_COL] = recs[NORMALIZED_SCORE_COL].astype("float32")
+    recs["peer_adoption_rate"] = recs["peer_adoption_rate"].fillna(0).astype("float32")
+    recs["median_unit_price"]  = recs["median_unit_price"].astype("float32")
+    recs["is_private_brand"]   = recs["is_private_brand"].fillna(0).astype("int8")
+    recs["is_mckesson_brand"]  = recs["is_mckesson_brand"].fillna(0).astype("int8")
+    recs["is_declining"]       = recs["is_declining"].fillna(0).astype("int8")
+    recs["is_churned"]         = recs["is_churned"].fillna(0).astype("int8")
+
+    recs = recs.sort_values(["DIM_CUST_CURR_ID", "rank"]).reset_index(drop=True)
+
+    PRECOMP.mkdir(parents=True, exist_ok=True)
+    ANALYSIS.mkdir(parents=True, exist_ok=True)
+
+    recs.to_parquet(RECS_OUT, index=False)
+    size_mb = RECS_OUT.stat().st_size / (1024 * 1024)
+    _log(f"Saved: {RECS_OUT.relative_to(ROOT)}  ({size_mb:.1f} MB)")
+    _log(f"  Total recommendations: {len(recs):,}")
+    _log(f"  Unique customers     : {recs['DIM_CUST_CURR_ID'].nunique():,}")
+
+    sample_custs = recs["DIM_CUST_CURR_ID"].unique()[:100]
+    sample = recs[recs["DIM_CUST_CURR_ID"].isin(sample_custs)]
+    sample.to_excel(RECS_SAMPLE_XLSX, index=False, engine="openpyxl")
+    _log(f"Saved sample xlsx ({len(sample):,} recs)")
+
+    _log(f"Step 15 done in {time.time()-t0:.1f}s")
+    return recs
+
+
+# Step 16: Stats
+
+def print_stats(recs: pd.DataFrame) -> None:
+    _s("Step 16: Distribution summary")
+
+    _log(f"Total recommendations: {len(recs):,}")
+    _log(f"Unique customers: {recs['DIM_CUST_CURR_ID'].nunique():,}")
+    _log("")
+
+    _log("Primary signal distribution:")
+    for sig, n in recs["primary_signal"].value_counts().items():
+        pct = n / len(recs) * 100
+        _log(f"  {sig:<22}  {n:>10,} ({pct:.1f}%)")
+
+    _log("")
+    _log("Rec purpose distribution (BUSINESS VIEW):")
+    for purp, n in recs["rec_purpose"].value_counts().items():
+        pct = n / len(recs) * 100
+        _log(f"  {purp:<22}  {n:>10,} ({pct:.1f}%)")
+
+    _log("")
+    n_mck = int(recs["is_mckesson_brand"].sum())
+    pct_mck = n_mck / len(recs) * 100
+    _log(f"McKesson Brand penetration: {n_mck:,}/{len(recs):,} ({pct_mck:.1f}%)")
+
+    _log("")
+    _log("Confidence tier distribution:")
+    for tier, n in recs["confidence_tier"].value_counts().items():
+        pct = n / len(recs) * 100
+        _log(f"  {tier:<10}  {n:>10,} ({pct:.1f}%)")
+
+    _log("")
+    if "specialty_match" in recs.columns:
+        _log("Specialty match distribution:")
+        for m, n in recs["specialty_match"].value_counts().items():
+            pct = n / len(recs) * 100
+            _log(f"  {m:<10}  {n:>10,} ({pct:.1f}%)")
+
+    _log("")
+    fam_div = recs.groupby("DIM_CUST_CURR_ID")["PROD_FMLY_LVL1_DSC"].nunique()
+    sig_div = recs.groupby("DIM_CUST_CURR_ID")["primary_signal"].nunique()
+    purp_div = recs.groupby("DIM_CUST_CURR_ID")["rec_purpose"].nunique()
+    _log(f"Family diversity per customer:  p10={fam_div.quantile(0.10):.0f}  "
+         f"median={fam_div.quantile(0.50):.0f}  p90={fam_div.quantile(0.90):.0f}")
+    _log(f"Signal diversity per customer:  p10={sig_div.quantile(0.10):.0f}  "
+         f"median={sig_div.quantile(0.50):.0f}  p90={sig_div.quantile(0.90):.0f}")
+    _log(f"Purpose diversity per customer: p10={purp_div.quantile(0.10):.0f}  "
+         f"median={purp_div.quantile(0.50):.0f}  p90={purp_div.quantile(0.90):.0f}")
+
+    _log("")
+    _log("Per-customer McKesson Brand counts:")
+    mck_per_cust = recs.groupby("DIM_CUST_CURR_ID")["is_mckesson_brand"].sum()
+    _log(f"  Customers with 0 McKesson recs : {(mck_per_cust == 0).sum():,}")
+    _log(f"  Customers with 1-3 McKesson    : {((mck_per_cust >= 1) & (mck_per_cust <= 3)).sum():,}")
+    _log(f"  Customers with 4-6 McKesson    : {((mck_per_cust >= 4) & (mck_per_cust <= 6)).sum():,}")
+    _log(f"  Customers with 7-10 McKesson   : {(mck_per_cust >= 7).sum():,}")
 
 
 # Main
 
 def main() -> None:
     print()
-    print("="*64)
-    print("  PRODUCT RECOMMENDATION FACTOR ANALYSIS")
-    print("="*64)
+    print("=" * 64)
+    print("  RECOMMENDATION ENGINE - PHASE 6 (Replenishment Signal)")
+    print("=" * 64)
     start = time.time()
 
-    OUT_PRECOMP.mkdir(parents=True, exist_ok=True)
-    OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
-    SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    inputs   = load_inputs()
+    cp       = build_customer_profile(inputs)
+    history  = load_customer_purchase_history()
+    products = filter_eligible_products(inputs["products"])
 
-    for f, lbl in [
-        (MERGED_FILE,  "merged_dataset.parquet"),
-        (PROD_FILE,    "products_clean.parquet"),
-        (FEATURE_FILE, "customer_features.parquet"),
-    ]:
-        if not f.exists():
-            print(f"\nFATAL: {lbl} not found. Run clean_data.py first.",
-                  file=sys.stderr)
-            sys.exit(1)
+    rec_dfs = []
 
-    try:
-        features              = load_features_and_segments()
-        history               = load_customer_product_history(features)
-        adoption              = compute_peer_adoption(history)
-        lapsed                = compute_lapsed_products(history)
-        recs_df               = build_recommendations(adoption, history, lapsed, features)
-        imp, factor_signals, auc = compute_recommendation_factors(history, adoption, features)
+    pg = generate_peer_gap_recs(
+        cp, inputs["seg_profiles"], products, inputs["specialty"], history
+    )
+    rec_dfs.append(pg)
+    del pg
+    gc.collect()
 
-        save_outputs(recs_df, adoption, imp, factor_signals, auc)
-    finally:
-        # Clean up the spill directory on success or failure
-        try:
-            import shutil
-            if SPILL_DIR.exists():
-                shutil.rmtree(SPILL_DIR, ignore_errors=True)
-        except Exception:
-            pass
+    cs = generate_coldstart_recs(cp, products, inputs["specialty"], history)
+    rec_dfs.append(cs)
+    del cs
+    gc.collect()
 
-    _s("Complete")
-    _log(f"Total time: {time.time()-start:.1f}s")
+    cart = generate_cart_complement_recs(
+        cp, inputs["cooccur"], products, inputs["specialty"], history
+    )
+    rec_dfs.append(cart)
+    del cart
+    gc.collect()
+
+    sim = generate_item_similarity_recs(
+        cp, inputs["item_sim"], products, inputs["specialty"], history
+    )
+    rec_dfs.append(sim)
+    del sim
+    gc.collect()
+
+    lapsed = generate_lapsed_recovery_recs(
+        cp, inputs["lapsed"], products, inputs["specialty"]
+    )
+    rec_dfs.append(lapsed)
+    del lapsed
+    gc.collect()
+
+    # Phase 6: replenishment
+    repl = generate_replenishment_recs(
+        cp, inputs["replenishment"], products, inputs["specialty"]
+    )
+    rec_dfs.append(repl)
+    del repl
+    gc.collect()
+
+    medline = generate_medline_conversion_recs(
+        cp, inputs["pb_equiv"], history, products, inputs["specialty"]
+    )
+    rec_dfs.append(medline)
+    del medline
+    gc.collect()
+
+    pb_upg = generate_pb_upgrade_recs(
+        cp, inputs["pb_equiv"], history, products, inputs["specialty"]
+    )
+    rec_dfs.append(pb_upg)
+    del pb_upg
+    gc.collect()
+
+    final = diversified_combine(rec_dfs)
+    del rec_dfs
+    gc.collect()
+
+    final = add_rec_purpose(final)
+    final = add_pitch_reasons(final)
+    final = save_recommendations(final)
+
+    print_stats(final)
+
+    _s("Phase 6 Complete")
+    _log(f"Total time: {time.time() - start:.1f}s")
     _log("")
-    _log("Key outputs:")
-    _log("  customer_recommendations.parquet        — top-N per customer (API)")
-    _log("  customer_recommendations.schema.json    — schema sidecar")
-    _log("  product_adoption_rates.parquet          — peer adoption per product")
-    _log("  recommendation_factors.parquet          — model feature signals")
-    _log("  recommendation_factors.xlsx             — team analysis report")
-    _log("  recommendation_family_adoption.png")
-    _log("  recommendation_factor_importance.png")
-    _log("  recommendation_signal_mix_by_segment.png")
+    _log(f"Output: {RECS_OUT.relative_to(ROOT)}")
+    _log(f"  Top {TOP_N_RECS} recommendations per customer")
+    _log(f"  {final['DIM_CUST_CURR_ID'].nunique():,} customers covered")
 
 
 if __name__ == "__main__":
@@ -1320,6 +1829,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)
-    except Exception as e:
-        print(f"\nFATAL ERROR: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"\nFATAL ERROR: {exc}", file=sys.stderr)
         raise

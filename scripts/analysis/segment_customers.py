@@ -7,9 +7,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, Reference
 
 warnings.filterwarnings("ignore")
 
@@ -21,6 +23,7 @@ DATA_CLEAN   = ROOT / "data_clean"
 FEATURE_FILE = DATA_CLEAN / "features"  / "customer_features.parquet"
 PRECOMP_DIR  = DATA_CLEAN / "serving"   / "precomputed"
 OUT_ANALYSIS = DATA_CLEAN / "analysis"
+OUT_CHARTS   = OUT_ANALYSIS / "charts"
 
 
 # Configuration
@@ -36,11 +39,17 @@ MKT_CD_LABELS = {
 }
 MKT_CD_OTHER = "OTHER"
 
-# RFM tier thresholds
-R_HIGH = 4
-F_HIGH = 4
-R_LOW  = 2
-F_LOW  = 2
+# Size tier ordering for consistent display
+SIZE_TIER_ORDER = ["new", "small", "mid", "large", "enterprise"]
+
+# Size tier display labels
+SIZE_TIER_LABELS = {
+    "new":        "New Customer",
+    "small":      "Small",
+    "mid":        "Mid",
+    "large":      "Large",
+    "enterprise": "Enterprise",
+}
 
 # Product family preferences per market type.
 # Used for the segmentation_report.xlsx strategy sheet only — informational,
@@ -66,25 +75,45 @@ PRIMARY_FAMILIES = {
             "Lab-Waived Lab", "Respiratory Products"],
 }
 
-# Scoring weights reference table for the segmentation_report.xlsx strategy sheet.
-# These MATCH the values in recommendation_factors.py (SEGMENT_WEIGHTS dict).
-# If you change the values in recommendation_factors.py, update this table too.
-# Healthcare distribution scoring: high-tier = cross-sell, low-tier = reactivate.
+# Scoring weights per size tier.
+# Larger customers have more budget for cross-sell, smaller customers rely
+# more on staying on file with lapsed reorders.
+# These MUST match the values in recommendation_factors.py SEGMENT_WEIGHTS.
 SCORING_REFERENCE = {
-    "_high": {"peer_gap": 3.5, "lapsed": 1.0,
-              "rationale": "Active customers — cross-sell new categories, minimize reorder nag"},
-    "_mid":  {"peer_gap": 2.5, "lapsed": 2.5,
-              "rationale": "Balanced — both signals carry equal weight"},
-    "_low":  {"peer_gap": 1.0, "lapsed": 3.5,
-              "rationale": "At-risk customers — reactivation via lapsed reorders is priority"},
+    "_new": {
+        "peer_gap": 2.0, "lapsed": 1.0,
+        "rationale": "New customer — stick to safe high-adoption items, no aggressive pitches"
+    },
+    "_small": {
+        "peer_gap": 2.0, "lapsed": 3.0,
+        "rationale": "Small customer — limited budget, prioritize staying on file via lapsed reorders"
+    },
+    "_mid": {
+        "peer_gap": 2.5, "lapsed": 2.5,
+        "rationale": "Mid-size customer — balanced cross-sell and reorders"
+    },
+    "_large": {
+        "peer_gap": 3.0, "lapsed": 2.0,
+        "rationale": "Large customer — budget available, cross-sell new categories"
+    },
+    "_enterprise": {
+        "peer_gap": 3.5, "lapsed": 1.5,
+        "rationale": "Enterprise customer — aggressive cross-sell, expansion focus"
+    },
 }
 PRIVATE_BRAND_BOOST = 0.5
+
+# Minimum segment size below which we flag as too small for reliable peer stats.
+# Segments below this still exist but the recommendation engine will produce
+# fewer recommendations for them (MIN_PEER_SIZE in recommendation_factors.py).
+MIN_SEGMENT_SIZE = 5
 
 
 # Logging
 
 def _s(title):
-    print(f"\n{'-'*64}\n  {title}\n{'-'*64}", flush=True)
+    print(f"\n{'-' * 64}\n  {title}\n{'-' * 64}", flush=True)
+
 
 def _log(msg):
     print(f"  {msg}", flush=True)
@@ -113,19 +142,7 @@ def _style(ws, df, hc="1F4E79"):
     ws.auto_filter.ref = ws.dimensions
     for col_cells in ws.columns:
         w = max((len(str(c.value)) if c.value else 0) for c in col_cells)
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max(w+2,12),55)
-
-
-def _chart(ws, n, lc, vc, anchor, title, xtitle, color="1F4E79"):
-    ch = BarChart()
-    ch.type = "bar"; ch.grouping = "clustered"; ch.title = title
-    ch.x_axis.title = xtitle; ch.legend = None
-    ch.width = 26; ch.height = 16; ch.style = 2
-    ch.add_data(Reference(ws, min_col=vc, min_row=1, max_row=n+1), titles_from_data=True)
-    ch.set_categories(Reference(ws, min_col=lc, min_row=2, max_row=n+1))
-    ch.series[0].graphicalProperties.solidFill = color
-    ch.series[0].graphicalProperties.line.solidFill = color
-    ws.add_chart(ch, anchor)
+        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(max(w + 2, 12), 55)
 
 
 # Step 1: Load features
@@ -137,13 +154,19 @@ def load_features():
         sys.exit(1)
     df = pd.read_parquet(FEATURE_FILE)
     _log(f"Loaded : {len(df):,} customers  |  {df.shape[1]} columns")
-    required = ["DIM_CUST_CURR_ID", "MKT_CD", "R_score", "F_score",
-                "monetary", "recency_days", "frequency",
-                "avg_revenue_per_order", "n_categories_bought",
-                "category_hhi", "cycle_regularity"]
+    required = [
+        "DIM_CUST_CURR_ID", "MKT_CD", "size_tier",
+        "monetary", "recency_days", "frequency",
+        "avg_revenue_per_order", "n_categories_bought",
+        "category_hhi", "cycle_regularity",
+        "median_monthly_spend", "active_months_last_12",
+        "affordability_ceiling",
+    ]
     missing = [c for c in required if c not in df.columns]
     if missing:
         print(f"\nFATAL: Missing columns: {missing}", file=sys.stderr)
+        print("Run clean_data.py first to generate size_tier and affordability_ceiling.",
+              file=sys.stderr)
         sys.exit(1)
     return df
 
@@ -151,44 +174,52 @@ def load_features():
 # Step 2: Assign segments
 
 def assign_segments(df):
-    # Build segment label as MKT_CD_tier (e.g. PO_high, LTC_low).
+    # Build segment label as MKT_CD_sizeTier (e.g. PO_small, LTC_enterprise).
     # MKT_CD values not in the known list fall back to OTHER.
-    # R_score/F_score nulls default to 3 (middle), placing that customer in 'mid'.
+    # size_tier is already computed in clean_data.py Step 6c.
 
-    _s("Step 2: Assigning segments — MKT_CD x RFM tier")
+    _s("Step 2: Assigning segments — MKT_CD x size tier")
     df = df.copy()
     df["mkt_cd_clean"] = df["MKT_CD"].fillna(MKT_CD_OTHER).str.strip().str.upper()
     df["mkt_cd_clean"] = df["mkt_cd_clean"].apply(
         lambda x: x if x in MKT_CD_LABELS else MKT_CD_OTHER
     )
 
-    r = df["R_score"].fillna(3).astype(float)
-    f = df["F_score"].fillna(3).astype(float)
-    conditions = [(r >= R_HIGH) & (f >= F_HIGH), (r <= R_LOW) | (f <= F_LOW)]
-    choices    = ["high", "low"]
-    df["rfm_tier"] = np.select(conditions, choices, default="mid")
-    df["segment"]  = df["mkt_cd_clean"] + "_" + df["rfm_tier"]
+    # size_tier already exists from clean_data.py — use as-is
+    df["segment"] = df["mkt_cd_clean"] + "_" + df["size_tier"]
 
     desc_map = {
-        "high": "Active frequent buyer — cross-sell opportunity",
-        "mid":  "Moderate engagement — balanced cross-sell and reactivation",
-        "low":  "Low engagement — reactivate with lapsed products first",
+        "new":        "New customer — safe high-adoption items only",
+        "small":      "Small customer — prioritize lapsed reorders",
+        "mid":        "Mid-size customer — balanced cross-sell and reorders",
+        "large":      "Large customer — cross-sell new categories",
+        "enterprise": "Enterprise customer — aggressive cross-sell and expansion",
     }
-    df["segment_description"] = df["rfm_tier"].map(desc_map)
+    df["segment_description"] = df["size_tier"].map(desc_map)
 
-    seg_counts = df.groupby(["mkt_cd_clean", "rfm_tier"]).size().reset_index(name="n")
-    seg_counts["segment"] = seg_counts["mkt_cd_clean"] + "_" + seg_counts["rfm_tier"]
+    seg_counts = (
+        df.groupby(["mkt_cd_clean", "size_tier"])
+        .size()
+        .reset_index(name="n")
+    )
+    seg_counts["segment"] = seg_counts["mkt_cd_clean"] + "_" + seg_counts["size_tier"]
     seg_counts = seg_counts.sort_values("n", ascending=False)
 
     _log(f"\n  {'Segment':<30} {'Customers':>10} {'% Portfolio':>12}")
-    _log(f"  {'-'*30} {'-'*10} {'-'*12}")
+    _log(f"  {'-' * 30} {'-' * 10} {'-' * 12}")
     for _, row in seg_counts.iterrows():
         pct = row["n"] / len(df) * 100
-        _log(f"  {row['segment']:<30} {row['n']:>10,} {pct:>11.1f}%")
+        warn = "  <-- small" if row["n"] < MIN_SEGMENT_SIZE else ""
+        _log(f"  {row['segment']:<30} {row['n']:>10,} {pct:>11.1f}%{warn}")
+
+    n_small_segs = (seg_counts["n"] < MIN_SEGMENT_SIZE).sum()
+    if n_small_segs > 0:
+        _log(f"\n  Warning: {n_small_segs} segment(s) have fewer than {MIN_SEGMENT_SIZE} customers.")
+        _log(f"  These will produce fewer recommendations due to MIN_PEER_SIZE threshold.")
 
     if "churn_label" in df.columns:
         churn_by_seg = (
-            df[df["churn_label"].isin([0,1])]
+            df[df["churn_label"].isin([0, 1])]
             .groupby("segment")["churn_label"]
             .mean().mul(100).round(1)
         )
@@ -208,48 +239,54 @@ def build_segment_profiles(df):
     agg = (
         df.groupby("segment")
         .agg(
-            mkt_cd           = ("mkt_cd_clean",         "first"),
-            rfm_tier         = ("rfm_tier",              "first"),
-            n_customers      = ("DIM_CUST_CURR_ID",      "count"),
-            median_monetary  = ("monetary",              "median"),
-            median_recency   = ("recency_days",          "median"),
-            median_frequency = ("frequency",             "median"),
-            median_avg_order = ("avg_revenue_per_order", "median"),
-            median_n_cats    = ("n_categories_bought",   "median"),
-            median_hhi       = ("category_hhi",          "median"),
-            median_cycle     = ("cycle_regularity",      "median"),
+            mkt_cd                = ("mkt_cd_clean",          "first"),
+            size_tier             = ("size_tier",             "first"),
+            n_customers           = ("DIM_CUST_CURR_ID",      "count"),
+            median_monetary       = ("monetary",              "median"),
+            median_monthly_spend  = ("median_monthly_spend",  "median"),
+            median_recency        = ("recency_days",          "median"),
+            median_frequency      = ("frequency",             "median"),
+            median_avg_order      = ("avg_revenue_per_order", "median"),
+            median_afford_ceiling = ("affordability_ceiling", "median"),
+            median_active_months  = ("active_months_last_12", "median"),
+            median_n_cats         = ("n_categories_bought",   "median"),
+            median_hhi            = ("category_hhi",          "median"),
+            median_cycle          = ("cycle_regularity",      "median"),
         )
         .reset_index()
     )
     if "churn_label" in df.columns:
         churn = (
-            df[df["churn_label"].isin([0,1])]
+            df[df["churn_label"].isin([0, 1])]
             .groupby("segment")["churn_label"]
             .mean().mul(100).round(1).reset_index()
             .rename(columns={"churn_label": "churn_rate_pct"})
         )
         agg = agg.merge(churn, on="segment", how="left")
 
-    # Attach the scoring weights from the reference table (tier-based)
+    # Attach scoring weights from the reference table (size-tier-based)
     def _tier_weights(tier, side):
         key = "_" + tier
         return SCORING_REFERENCE.get(key, SCORING_REFERENCE["_mid"])[side]
 
-    agg["peer_gap_weight"] = agg["rfm_tier"].apply(lambda t: _tier_weights(t, "peer_gap"))
-    agg["lapsed_weight"]   = agg["rfm_tier"].apply(lambda t: _tier_weights(t, "lapsed"))
+    agg["peer_gap_weight"] = agg["size_tier"].apply(lambda t: _tier_weights(t, "peer_gap"))
+    agg["lapsed_weight"]   = agg["size_tier"].apply(lambda t: _tier_weights(t, "lapsed"))
     agg["primary_signal"]  = agg.apply(
         lambda r: "peer_gap" if r["peer_gap_weight"] >= r["lapsed_weight"] else "lapsed",
         axis=1
     )
     agg["mkt_label"] = agg["mkt_cd"].map(lambda x: MKT_CD_LABELS.get(x, "Other"))
-    agg = agg.sort_values(["mkt_cd", "rfm_tier"]).reset_index(drop=True)
 
-    _log(f"\n  {'Segment':<30} {'N':>8} {'Churn%':>7} {'Median$':>10} {'$/order':>9} {'Freq':>6}")
-    _log(f"  {'-'*30} {'-'*8} {'-'*7} {'-'*10} {'-'*9} {'-'*6}")
+    # Sort for display: market then size tier in defined order
+    agg["_tier_order"] = agg["size_tier"].map({t: i for i, t in enumerate(SIZE_TIER_ORDER)})
+    agg = agg.sort_values(["mkt_cd", "_tier_order"]).drop(columns=["_tier_order"]).reset_index(drop=True)
+
+    _log(f"\n  {'Segment':<30} {'N':>8} {'Churn%':>7} {'Median$/mo':>11} {'$/order':>9} {'Freq':>6}")
+    _log(f"  {'-' * 30} {'-' * 8} {'-' * 7} {'-' * 11} {'-' * 9} {'-' * 6}")
     for _, r in agg.iterrows():
         churn = f"{r.get('churn_rate_pct', 0):.1f}%" if pd.notna(r.get("churn_rate_pct")) else "n/a"
         _log(f"  {r['segment']:<30} {r['n_customers']:>8,} {churn:>7} "
-             f"${r['median_monetary']:>9,.0f} ${r['median_avg_order']:>8,.0f} "
+             f"${r['median_monthly_spend']:>10,.0f} ${r['median_avg_order']:>8,.0f} "
              f"{r['median_frequency']:>6.0f}")
     return agg
 
@@ -264,32 +301,33 @@ def save_outputs(df, profiles):
     PRECOMP_DIR.mkdir(parents=True, exist_ok=True)
     OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
 
-    # customer_segments.parquet — one row per customer
+    # customer_segments.parquet — one row per customer, minimal columns
     seg_out = df[[
-        "DIM_CUST_CURR_ID", "segment", "mkt_cd_clean", "rfm_tier",
-        "segment_description"
+        "DIM_CUST_CURR_ID", "segment", "mkt_cd_clean", "size_tier"
     ]].copy()
 
     # Type safety for downstream joins
     seg_out["DIM_CUST_CURR_ID"] = seg_out["DIM_CUST_CURR_ID"].astype("int64")
-    for c in ["segment", "mkt_cd_clean", "rfm_tier", "segment_description"]:
+    for c in ["segment", "mkt_cd_clean", "size_tier"]:
         seg_out[c] = seg_out[c].fillna("").astype(str)
 
     seg_path = PRECOMP_DIR / "customer_segments.parquet"
     seg_out.to_parquet(seg_path, index=False)
     _log(f"Saved: {seg_path.relative_to(ROOT)}")
 
-    # Strategy-by-segment reference table (tier x market, informational)
+    # Strategy-by-segment reference table (size tier x market, informational)
     strat_rows = []
-    for mkt_cd, label in MKT_CD_LABELS.items():
+    for mkt_cd in list(MKT_CD_LABELS.keys()) + [MKT_CD_OTHER]:
+        label = MKT_CD_LABELS.get(mkt_cd, "Other")
         fams = PRIMARY_FAMILIES.get(mkt_cd, [])
-        for tier in ["high", "mid", "low"]:
+        for tier in SIZE_TIER_ORDER:
             key = "_" + tier
             w = SCORING_REFERENCE[key]
             strat_rows.append({
                 "segment":           f"{mkt_cd}_{tier}",
                 "customer_type":     label,
-                "rfm_tier":          tier,
+                "size_tier":         tier,
+                "size_tier_label":   SIZE_TIER_LABELS[tier],
                 "peer_gap_weight":   w["peer_gap"],
                 "lapsed_weight":     w["lapsed"],
                 "primary_signal":    "peer_gap" if w["peer_gap"] >= w["lapsed"] else "lapsed",
@@ -314,103 +352,189 @@ def save_outputs(df, profiles):
     _log(f"Saved: {xlsx_path.relative_to(ROOT)}")
 
 
-def save_svg(profiles):
-    # Legacy SVG dashboard. Kept as-is for now.
-    # TODO: replace with PNG charts (segment_sizes, churn_by_segment, spend_distribution)
-    # when the frontend doesn't need it anymore.
+# Step 5: Save PNG charts
 
-    _s("Step 5: Saving SVG dashboard")
-    SEG_COLORS = {
-        "PO":("#1F4E79","#D6E4F0"), "LTC":("#375623","#D4EDE9"),
-        "SC":("#7030A0","#F0E6F8"), "LC": ("#833C00","#FEF3DC"),
-        "HC":("#C00000","#FDEAEA"), "AC": ("#185FA5","#E6F1FB"),
-        MKT_CD_OTHER:("#666666","#F5F5F5"),
-    }
-    mkt_order = ["PO","LTC","SC","LC","HC","AC",MKT_CD_OTHER]
-    n_mkts = sum(1 for m in mkt_order if m in profiles["mkt_cd"].values)
-    W=680; PAD=32; TITLE_H=50; CARD_H=96; GAP=8
-    TOTAL_H = TITLE_H + PAD + n_mkts*(CARD_H+GAP) + PAD
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 {W} {TOTAL_H}" role="img">',
-        f'<rect width="{W}" height="{TOTAL_H}" fill="#F8F9FA"/>',
-        f'<rect x="0" y="0" width="{W}" height="{TITLE_H}" fill="#1F4E79"/>',
-        f'<text x="{W//2}" y="{TITLE_H//2+6}" text-anchor="middle" fill="white" ',
-        f'font-family="Arial" font-size="15" font-weight="bold">',
-        f'Customer Segments — Market Type x RFM Tier</text>',
+def save_charts(df, profiles):
+    # Writes 4 PNG charts to data_clean/analysis/charts/.
+    # Chart 1: size_tier distribution
+    # Chart 2: market code distribution
+    # Chart 3: market x size heatmap
+    # Chart 4: median monthly spend per size tier
+
+    _s("Step 5: Saving PNG charts")
+    OUT_CHARTS.mkdir(parents=True, exist_ok=True)
+
+    # Chart 1: size_tier distribution
+    tier_counts = (
+        df["size_tier"].value_counts()
+        .reindex(SIZE_TIER_ORDER, fill_value=0)
+    )
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = ["#888888", "#375623", "#1F4E79", "#7030A0", "#C00000"]
+    bars = ax.bar(
+        [SIZE_TIER_LABELS[t] for t in tier_counts.index],
+        tier_counts.values,
+        color=colors
+    )
+    for bar, count in zip(bars, tier_counts.values):
+        pct = count / tier_counts.sum() * 100
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{count:,}\n({pct:.1f}%)",
+            ha="center", va="bottom", fontsize=9
+        )
+    ax.set_title("Customer count by size tier", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Number of customers")
+    ax.set_ylim(0, tier_counts.max() * 1.15)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    path = OUT_CHARTS / "01_size_tier_distribution.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    _log(f"Saved: {path.relative_to(ROOT)}")
+
+    # Chart 2: market code distribution
+    mkt_counts = df["mkt_cd_clean"].value_counts()
+    mkt_labels = [
+        f"{code}\n{MKT_CD_LABELS.get(code, 'Other')}"
+        for code in mkt_counts.index
     ]
-    y0 = TITLE_H + PAD
-    for mkt in mkt_order:
-        grp = profiles[profiles["mkt_cd"] == mkt]
-        if len(grp) == 0:
-            continue
-        stroke, fill = SEG_COLORS.get(mkt, SEG_COLORS[MKT_CD_OTHER])
-        label   = MKT_CD_LABELS.get(mkt, "Other")
-        n_tot   = int(grp["n_customers"].sum())
-        med_sp  = grp["median_monetary"].median()
-        med_or  = grp["median_avg_order"].median()
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.bar(mkt_labels, mkt_counts.values, color="#1F4E79")
+    for bar, count in zip(bars, mkt_counts.values):
+        pct = count / mkt_counts.sum() * 100
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{count:,}\n({pct:.1f}%)",
+            ha="center", va="bottom", fontsize=9
+        )
+    ax.set_title("Customer count by market code", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Number of customers")
+    ax.set_ylim(0, mkt_counts.max() * 1.15)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    path = OUT_CHARTS / "02_market_distribution.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    _log(f"Saved: {path.relative_to(ROOT)}")
 
-        tier_txt = "  ".join([
-            f"{r['rfm_tier'].upper()}: {r['n_customers']:,}"
-            for _, r in grp.sort_values("rfm_tier").iterrows()
-        ])
+    # Chart 3: market x size heatmap
+    pivot = (
+        df.groupby(["mkt_cd_clean", "size_tier"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=SIZE_TIER_ORDER, fill_value=0)
+    )
 
-        lines += [
-            f'<rect x="{PAD}" y="{y0}" width="{W-PAD*2}" height="{CARD_H}" rx="8" '
-            f'fill="{fill}" stroke="{stroke}" stroke-width="1.5"/>',
-            f'<text x="{PAD+14}" y="{y0+22}" font-family="Arial" font-size="13" '
-            f'font-weight="bold" fill="{stroke}">{mkt} — {label}</text>',
-            f'<text x="{W-PAD-14}" y="{y0+22}" text-anchor="end" font-family="Arial" '
-            f'font-size="12" fill="{stroke}">{n_tot:,} customers</text>',
-            f'<line x1="{PAD+8}" y1="{y0+32}" x2="{W-PAD-8}" y2="{y0+32}" '
-            f'stroke="{stroke}" stroke-width="0.5" opacity="0.4"/>',
-            f'<text x="{PAD+14}" y="{y0+50}" font-family="Arial" font-size="10" '
-            f'fill="{stroke}" opacity="0.85">Median annual spend: ${med_sp:,.0f}  '
-            f'-  Avg order: ${med_or:,.0f}</text>',
-            f'<text x="{PAD+14}" y="{y0+68}" font-family="Arial" font-size="10" '
-            f'font-weight="bold" fill="{stroke}">RFM tiers: {tier_txt}</text>',
-            f'<text x="{PAD+14}" y="{y0+86}" font-family="Arial" font-size="9" '
-            f'fill="{stroke}" opacity="0.75">Scoring varies by tier: _high = cross-sell '
-            f'(3.5x/1.0x), _mid = balanced (2.5x/2.5x), _low = reactivate (1.0x/3.5x)</text>',
-        ]
-        y0 += CARD_H + GAP
-    lines.append("</svg>")
-    svg_path = OUT_ANALYSIS / "segmentation_dashboard.svg"
-    svg_path.write_text("\n".join(lines), encoding="utf-8")
-    _log(f"Saved: {svg_path.relative_to(ROOT)}")
+    # Sort markets by total customer count for readability
+    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    im = ax.imshow(pivot.values, aspect="auto", cmap="Blues")
+
+    # Annotations
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            val = pivot.values[i, j]
+            text_color = "white" if val > pivot.values.max() * 0.5 else "black"
+            ax.text(
+                j, i, f"{val:,}",
+                ha="center", va="center",
+                color=text_color, fontsize=9
+            )
+
+    ax.set_xticks(range(len(SIZE_TIER_ORDER)))
+    ax.set_xticklabels([SIZE_TIER_LABELS[t] for t in SIZE_TIER_ORDER], rotation=0)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_title("Customer count by market code x size tier",
+                 fontsize=13, fontweight="bold")
+    ax.set_xlabel("Size tier")
+    ax.set_ylabel("Market code")
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Number of customers")
+
+    plt.tight_layout()
+    path = OUT_CHARTS / "03_market_x_size_heatmap.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    _log(f"Saved: {path.relative_to(ROOT)}")
+
+    # Chart 4: median monthly spend per size tier
+    spend_by_tier = (
+        df.groupby("size_tier")["median_monthly_spend"]
+        .median()
+        .reindex(SIZE_TIER_ORDER)
+    )
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(
+        [SIZE_TIER_LABELS[t] for t in spend_by_tier.index],
+        spend_by_tier.values,
+        color=colors
+    )
+    for bar, val in zip(bars, spend_by_tier.values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"${val:,.0f}",
+            ha="center", va="bottom", fontsize=10, fontweight="bold"
+        )
+    ax.set_title(
+        "Median monthly spend by size tier (validates tier definitions)",
+        fontsize=13, fontweight="bold"
+    )
+    ax.set_ylabel("Median monthly spend ($)")
+    ax.set_yscale("log")
+    ax.grid(axis="y", alpha=0.3, which="both")
+    plt.tight_layout()
+    path = OUT_CHARTS / "04_median_spend_by_tier.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    _log(f"Saved: {path.relative_to(ROOT)}")
 
 
 # Main
 
 def main():
-    print(); print("="*64)
-    print("  CUSTOMER SEGMENTATION — MKT_CD x RFM TIER")
-    print("="*64)
+    print()
+    print("=" * 64)
+    print("  CUSTOMER SEGMENTATION — MKT_CD x SIZE TIER")
+    print("=" * 64)
     start = time.time()
     PRECOMP_DIR.mkdir(parents=True, exist_ok=True)
     OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
+    OUT_CHARTS.mkdir(parents=True, exist_ok=True)
 
     features = load_features()
     df       = assign_segments(features)
     profiles = build_segment_profiles(df)
     save_outputs(df, profiles)
-    save_svg(profiles)
+    save_charts(df, profiles)
 
     _s("Complete")
-    _log(f"Total time: {round(time.time()-start,1)}s")
+    _log(f"Total time: {round(time.time() - start, 1)}s")
     _log("")
-    _log("Segment logic: MKT_CD (PO/LTC/SC/LC/HC/AC) x RFM tier (high/mid/low)")
+    _log("Segment logic: MKT_CD (PO/LTC/SC/LC/HC/AC/OTHER) x size_tier (new/small/mid/large/enterprise)")
     _log("Scoring weights: defined in recommendation_factors.py SEGMENT_WEIGHTS")
     _log("")
     _log("Key outputs:")
-    _log("  customer_segments.parquet   — segment per customer (read by recommendation_factors.py)")
-    _log("  segmentation_report.xlsx    — profiles and strategy per segment")
-    _log("  segmentation_dashboard.svg  — visual summary of market + RFM distribution")
+    _log("  customer_segments.parquet        segment per customer (read by recommendation_factors.py)")
+    _log("  segmentation_report.xlsx         profiles and strategy per segment")
+    _log("  charts/01_size_tier_distribution.png")
+    _log("  charts/02_market_distribution.png")
+    _log("  charts/03_market_x_size_heatmap.png")
+    _log("  charts/04_median_spend_by_tier.png")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr); sys.exit(1)
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
     except Exception as exc:
-        print(f"\nFATAL ERROR: {exc}", file=sys.stderr); raise
+        print(f"\nFATAL ERROR: {exc}", file=sys.stderr)
+        raise

@@ -6,10 +6,8 @@ import warnings
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
-from typing import Optional
 
 import duckdb
-import numpy as np
 import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -20,12 +18,11 @@ warnings.filterwarnings("ignore")
 
 # Paths
 
-ROOT        = Path(__file__).resolve().parent.parent.parent
-DATA_CLEAN  = ROOT / "data_clean"
-MERGED_FILE = DATA_CLEAN / "serving"  / "merged_dataset.parquet"
-SEG_FILE    = DATA_CLEAN / "serving"  / "precomputed" / "customer_segments.parquet"
-FEAT_FILE   = DATA_CLEAN / "features" / "customer_features.parquet"
-OUT_PRECOMP = DATA_CLEAN / "serving"  / "precomputed"
+ROOT         = Path(__file__).resolve().parent.parent.parent
+DATA_CLEAN   = ROOT / "data_clean"
+MERGED_FILE  = DATA_CLEAN / "serving"  / "merged_dataset.parquet"
+SEG_FILE     = DATA_CLEAN / "serving"  / "precomputed" / "customer_segments.parquet"
+OUT_PRECOMP  = DATA_CLEAN / "serving"  / "precomputed"
 OUT_ANALYSIS = DATA_CLEAN / "analysis"
 
 
@@ -37,15 +34,14 @@ OUT_ANALYSIS = DATA_CLEAN / "analysis"
 FISCAL_YEARS = ("FY2425", "FY2526")
 
 # Minimum support: a category pair must co-occur in this fraction of segment
-# customers to be recorded as an association rule. Set low because healthcare
-# purchasing is inherently niche — a 5% co-occurrence in wound care is strong.
-MIN_SUPPORT       = 0.05
+# customers to be recorded as an association rule.
+MIN_SUPPORT       = 0.03
 
 # Minimum confidence: given that a customer bought category A, this is the
 # floor probability that they also bought category B within the window.
 MIN_CONFIDENCE    = 0.20
 
-# Co-occurrence window in days. Two categories are "co-purchased" if orders
+# Co-occurrence window in days. Two categories are co-purchased if orders
 # from each appear within this window. 90 days captures a quarterly cycle.
 CO_OCCUR_WINDOW   = 90
 
@@ -73,6 +69,7 @@ EXCLUDED_FAMILIES = {"Fee", "Unknown", "NaN", "nan", ""}
 
 def _log(msg: str) -> None:
     print(f"  {msg}", flush=True)
+
 
 def _section(title: str) -> None:
     print(f"\n{'-' * 64}\n  {title}\n{'-' * 64}", flush=True)
@@ -131,36 +128,38 @@ def _chart(ws, n, lc, vc, anchor, title, xtitle, color="1F4E79") -> None:
 
 # Step 1: Load inputs
 
-def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_inputs() -> pd.DataFrame:
+    # Returns transaction rows joined with segment labels.
+    # One row per customer-family pair, with first order date and order count.
+
     _section("Step 1: Loading inputs")
 
     for path, label in [
         (MERGED_FILE, "merged_dataset.parquet"),
         (SEG_FILE,    "customer_segments.parquet"),
-        (FEAT_FILE,   "customer_features.parquet"),
     ]:
         if not path.exists():
             print(f"\nFATAL: {label} not found at {path}", file=sys.stderr)
             print("Run clean_data.py then segment_customers.py first.", file=sys.stderr)
             sys.exit(1)
 
-    segments = pd.read_parquet(SEG_FILE, columns=["DIM_CUST_CURR_ID", "segment"])
+    segments = pd.read_parquet(
+        SEG_FILE, columns=["DIM_CUST_CURR_ID", "segment", "mkt_cd_clean", "size_tier"]
+    )
     _log(f"Segments loaded  : {len(segments):,} customers")
 
     seg_counts = segments["segment"].value_counts()
-    for seg, cnt in seg_counts.items():
+    _log(f"Total segments   : {len(seg_counts)}")
+    _log(f"Segments with >= {MIN_SEGMENT_SIZE} customers: {(seg_counts >= MIN_SEGMENT_SIZE).sum()}")
+    _log(f"Segments skipped (< {MIN_SEGMENT_SIZE} customers): {(seg_counts < MIN_SEGMENT_SIZE).sum()}")
+
+    _log("")
+    _log("Segment sizes (top 10):")
+    for seg, cnt in seg_counts.head(10).items():
         _log(f"  {seg:<30} {cnt:>8,} customers")
 
-    features = pd.read_parquet(FEAT_FILE, columns=[
-        "DIM_CUST_CURR_ID", "SPCLTY_CD", "R_score", "F_score",
-        "monetary", "recency_days",
-    ])
-    _log(f"Features loaded  : {len(features):,} customers")
-
-    # Load transactions spanning both fiscal years. Four columns needed:
-    #   cust_id, product_family, first_order_date, order_count.
-    # DuckDB processes the 7.4 GB file in-process so pandas never holds it.
-    _log("Loading transactions via DuckDB (both FY2425 and FY2526, takes ~90s)...")
+    _log("")
+    _log(f"Loading transactions via DuckDB (both {FISCAL_YEARS[0]} and {FISCAL_YEARS[1]}, takes ~90s)...")
     t0  = time.time()
     con = duckdb.connect()
 
@@ -205,7 +204,7 @@ def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # Aggregate in DuckDB before pulling to pandas to avoid OOM.
     # DIM_ORDR_DT_ID is a YYYYMMDD integer. We compute a proper date_days value
     # (days since 1970-01-01) via MAKE_DATE so the 90-day co-occurrence window
-    # uses accurate arithmetic, not the old y*365+m*30 approximation.
+    # uses accurate arithmetic.
     txn = con.execute(f"""
         SELECT
             CAST(DIM_CUST_CURR_ID AS BIGINT)              AS cust_id,
@@ -240,7 +239,9 @@ def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     # Attach segment labels to transactions
     txn = txn.merge(
-        segments.rename(columns={"DIM_CUST_CURR_ID": "cust_id"}),
+        segments[["DIM_CUST_CURR_ID", "segment"]].rename(
+            columns={"DIM_CUST_CURR_ID": "cust_id"}
+        ),
         on="cust_id", how="left"
     )
     unmatched = txn["segment"].isna().sum()
@@ -248,15 +249,12 @@ def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         _log(f"Warning: {unmatched:,} transaction rows have no segment match — dropped")
         txn = txn.dropna(subset=["segment"])
 
-    return txn, segments, features
+    return txn
 
 
 # Step 2: Category co-occurrence
 
-def compute_category_cooccurrence(
-    txn: pd.DataFrame,
-    segments: pd.DataFrame,
-) -> pd.DataFrame:
+def compute_category_cooccurrence(txn: pd.DataFrame) -> pd.DataFrame:
     # For each segment, find category pairs that co-occur within CO_OCCUR_WINDOW
     # days in the same customer. Compute support (co-occurrence frequency),
     # confidence (P(B|A)), and lift (how much more common than random).
@@ -265,7 +263,10 @@ def compute_category_cooccurrence(
 
     all_rules = []
 
-    for seg in txn["segment"].unique():
+    # Sort segments by size descending so large segments process first
+    seg_sizes = txn.groupby("segment")["cust_id"].nunique().sort_values(ascending=False)
+
+    for seg in seg_sizes.index:
         seg_txn = txn[txn["segment"] == seg]
         n_custs = seg_txn["cust_id"].nunique()
 
@@ -375,7 +376,7 @@ def _cooccur_action(cat_a: str, cat_b: str,
 
 def compute_category_sequences(txn: pd.DataFrame) -> pd.DataFrame:
     # For each segment, find first-order category transitions.
-    # "After category A, customer typically buys B next."
+    # After category A, customer typically buys B next.
     # Used by recommendation_factors.py for pitch message enrichment.
 
     _section("Step 3: Category purchase sequences within segments")
@@ -384,7 +385,9 @@ def compute_category_sequences(txn: pd.DataFrame) -> pd.DataFrame:
 
     all_sequences = []
 
-    for seg in txn["segment"].unique():
+    seg_sizes = txn.groupby("segment")["cust_id"].nunique().sort_values(ascending=False)
+
+    for seg in seg_sizes.index:
         seg_txn = txn[txn["segment"] == seg]
         n_custs = seg_txn["cust_id"].nunique()
 
@@ -494,7 +497,7 @@ def compute_segment_category_profiles(txn: pd.DataFrame) -> pd.DataFrame:
     _log(f"Category-segment profiles: {len(profile):,} rows")
     _log(f"Segments covered: {profile['segment'].nunique()}")
 
-    for seg in profile["segment"].unique():
+    for seg in sorted(profile["segment"].unique()):
         top = profile[profile["segment"] == seg].head(5)
         _log(f"\n  {seg} — top 5 categories by adoption:")
         for _, r in top.iterrows():
@@ -551,8 +554,8 @@ def _normalise_profile_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_outputs(
-    rules_df:  pd.DataFrame,
-    seq_df:    pd.DataFrame,
+    rules_df:   pd.DataFrame,
+    seq_df:     pd.DataFrame,
     profile_df: pd.DataFrame,
 ) -> None:
     _section("Step 5: Saving outputs")
@@ -672,9 +675,9 @@ def main() -> None:
     OUT_PRECOMP.mkdir(parents=True, exist_ok=True)
     OUT_ANALYSIS.mkdir(parents=True, exist_ok=True)
 
-    txn, segments, features = load_inputs()
+    txn = load_inputs()
 
-    rules_df   = compute_category_cooccurrence(txn, segments)
+    rules_df   = compute_category_cooccurrence(txn)
     seq_df     = compute_category_sequences(txn)
     profile_df = compute_segment_category_profiles(txn)
 
