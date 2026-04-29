@@ -25,7 +25,7 @@ CUSTOMER_PATTERNS_FILE = (
 # Each tuple: (status, segment_substring, count)
 # We aim for spread across markets and size tiers.
 TARGET_PICKS: list[tuple[str, list[str], int]] = [
-    # --- STABLE WARM (20 total) ---
+    # STABLE WARM (20 total)
     # PO market: 6 customers across size tiers
     ("stable_warm", ["PO_new"],         1),
     ("stable_warm", ["PO_small"],       2),
@@ -51,14 +51,14 @@ TARGET_PICKS: list[tuple[str, list[str], int]] = [
     ("stable_warm", ["AC_large"],       1),
     ("stable_warm", ["AC_enterprise"],  1),
 
-    # --- DECLINING WARM (5 total) ---
+    # DECLINING WARM (5 total)
     ("declining_warm", ["PO_small"],      1),
     ("declining_warm", ["PO_mid"],        1),
     ("declining_warm", ["LTC_mid"],       1),
     ("declining_warm", ["SC_mid"],        1),
     ("declining_warm", ["AC_large"],      1),
 
-    # --- CHURNED WARM (5 total) ---
+    # CHURNED WARM (5 total)
     ("churned_warm", ["PO_small"],     1),
     ("churned_warm", ["PO_mid"],       1),
     ("churned_warm", ["LTC_small"],    1),

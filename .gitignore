@@ -1,135 +1,81 @@
-# DATA — never commit
-data_raw/
-data_clean/
-analysis_outputs/
-logs/
-
-*.parquet
-*.csv
-*.xlsx
-*.xls
-*.xlsm
-
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.tiff
-*.svg
-*.pdf
-
-*.duckdb
-*.db
-*.sqlite
-*.sqlite3
-*.dump
-*.sql.gz
-
-# PYTHON
+﻿# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
 
 # Virtual environments
-venv/
 .venv/
+venv/
 env/
 ENV/
-env.bak/
-venv.bak/
-.conda/
 
-# Pytest / coverage
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-.hypothesis/
-coverage.xml
-*.cover
-.cache
-nosetests.xml
-
-# Type checkers
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# ENVIRONMENT / SECRETS
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-secrets/
-
-# IDE / EDITORS
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-.spyderproject
-.spyproject
-.ropeproject
+*.sublime-*
 
-# OS FILES
-Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-Desktop.ini
-$RECYCLE.BIN/
-*.lnk
+# Environment / secrets
+.env
+.env.local
+.env.production
+.env.*.local
 
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Spotlight-V100
-.Trashes
+# Data files (these belong in S3/R2/Drive, NOT git)
+data_raw/
+data_clean/
+analysis_outputs/
+*.parquet
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
 
-.fuse_hidden*
-.directory
-.Trash-*
+# Large CSVs (keep small reference CSVs by exception)
+*.csv
+!demo_picks_v2.csv
+!.env.example
 
-# MISC
-*.bak
-*.backup
-*.old
+# Generated outputs
+*.log
 *.tmp
-*.temp
+api_test_report_*.xlsx
+*.bak
+*.bak2
+*.backup
+
+# Archive (kept locally but not in repo)
+archive/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local development scratch
+*~
+*.orig
+scratch/
 tmp/
-temp/
-cleanup_*.ps1
-clean_push*.ps1
-*_BACKUP_*.zip
+
+# cleanup
+cleanup.ps1
+cleanup_project.ps1
+inventory_project.ps1
+# Rankings reports (large generated CSVs)
+rankings_report/
+
+# Rankings reports (large generated CSVs)
+rankings_report/

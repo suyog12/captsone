@@ -9,9 +9,7 @@ import pandas as pd
 from backend.config import settings
 
 
-# -------------------------------------------------------------
 # Paths to the parquet files the API needs
-# -------------------------------------------------------------
 
 PRECOMPUTED_DIR = settings.precomputed_dir
 
@@ -32,9 +30,7 @@ SEGMENT_CADENCE_FILE       = PRECOMPUTED_DIR / "product_segment_cadence.parquet"
 MERGED_DATASET_FILE = settings.merged_file
 
 
-# -------------------------------------------------------------
 # Query helper
-# -------------------------------------------------------------
 
 
 def get_duckdb_connection() -> duckdb.DuckDBPyConnection:

@@ -19,6 +19,8 @@ class Customer(Base):
     market_code:         Mapped[Optional[str]] = mapped_column(String(20))
     segment:             Mapped[Optional[str]] = mapped_column(String(50))
     supplier_profile:    Mapped[Optional[str]] = mapped_column(String(50))
+    status:              Mapped[Optional[str]] = mapped_column(String(20))
+    archetype:           Mapped[Optional[str]] = mapped_column(String(50))
     assigned_seller_id:  Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("users.user_id")
     )
@@ -30,5 +32,5 @@ class Customer(Base):
     def __repr__(self) -> str:
         return (
             f"<Customer(cust_id={self.cust_id}, segment={self.segment!r}, "
-            f"market={self.market_code!r})>"
+            f"status={self.status!r}, archetype={self.archetype!r})>"
         )

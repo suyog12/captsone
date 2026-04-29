@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +42,48 @@ async def search_customers(
     """
     seller_id = user.user_id if user.role == "seller" else None
     rows = await customer_service.search(db, q, limit=limit, seller_id=seller_id)
+    return [CustomerSearchResult.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/filter",
+    response_model=list[CustomerSearchResult],
+    summary="Filter customers by segment, status, archetype, market, or specialty",
+)
+async def filter_customers(
+    segment:        Optional[str] = Query(None, description="e.g. 'PO_large'"),
+    status:         Optional[str] = Query(None, description="cold_start | stable_warm | declining_warm | churned_warm"),
+    archetype:      Optional[str] = Query(None, description="e.g. 'surgery_center', 'primary_care'"),
+    market_code:    Optional[str] = Query(None, description="e.g. 'PO', 'SC', 'LTC'"),
+    specialty_code: Optional[str] = Query(None, description="e.g. 'FP', 'GS'"),
+    limit:          int = Query(25, ge=1, le=100),
+    offset:         int = Query(0, ge=0),
+    user: User = Depends(require_seller_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[CustomerSearchResult]:
+    """
+    Filtered customer browsing for the dashboard.
+
+    All filters are optional and combine with AND. Common queries:
+      GET /customers/filter?status=churned_warm
+      GET /customers/filter?archetype=surgery_center&segment=SC_large
+      GET /customers/filter?status=declining_warm&segment=LTC_mid
+
+    For admin: filters across the entire customer base.
+    For seller: filters only customers assigned to this seller.
+    """
+    seller_id = user.user_id if user.role == "seller" else None
+    rows = await customer_service.search_by_filters(
+        db,
+        segment=segment,
+        status=status,
+        archetype=archetype,
+        market_code=market_code,
+        specialty_code=specialty_code,
+        seller_id=seller_id,
+        limit=limit,
+        offset=offset,
+    )
     return [CustomerSearchResult.model_validate(r) for r in rows]
 
 

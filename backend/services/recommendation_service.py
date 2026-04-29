@@ -14,7 +14,7 @@ from backend.db.parquet_store import (
     RECOMMENDATIONS_FILE,
     duckdb_query,
 )
-from backend.models import Customer, Inventory, Product
+from backend.models import CartItem, Customer, Inventory, Product
 from backend.schemas.recommendation import (
     CartComplement,
     MedlineConversion,
@@ -192,7 +192,7 @@ async def get_recommendations(
     segment = customer.segment if customer else None
     specialty = customer.specialty_code if customer else None
 
-    # --- Try precomputed first ---
+    # Try precomputed first
     df = _query_precomputed(cust_id, n)
 
     if not df.empty:
@@ -225,7 +225,7 @@ async def get_recommendations(
             ))
         return "precomputed", items, segment, specialty
 
-    # --- Cold-start fallback ---
+    # Cold-start fallback
     df = _query_cold_start(segment, specialty, n)
     if df.empty:
         return "cold_start", [], segment, specialty
@@ -368,26 +368,72 @@ def _query_medline_conversions(cart_items: list[int], n: int = 3) -> pd.DataFram
     )
 
 
+async def _read_active_cart_from_db(
+    db: AsyncSession, cust_id: int
+) -> list[int]:
+    """Return the item_ids currently in the customer's active cart.
+
+    Reads from recdash.cart_items WHERE cust_id = ? AND status = 'in_cart',
+    returning a deduplicated list of item_ids in the order they were added.
+    """
+    result = await db.execute(
+        select(CartItem.item_id)
+        .where(CartItem.cust_id == cust_id)
+        .where(CartItem.status == "in_cart")
+        .order_by(CartItem.added_at)
+    )
+    seen: set[int] = set()
+    out: list[int] = []
+    for (item_id,) in result.all():
+        iid = int(item_id)
+        if iid not in seen:
+            seen.add(iid)
+            out.append(iid)
+    return out
+
+
 async def get_cart_helper(
     db: AsyncSession,
     cust_id: int,
-    cart_items: list[int],
-) -> tuple[list[CartComplement], list[PrivateBrandUpgrade], list[MedlineConversion]]:
-    """Run the three live signals against the cart and return suggestions."""
-    cart_items = [int(i) for i in cart_items if i]
+    cart_items: Optional[list[int]] = None,
+) -> tuple[list[CartComplement], list[PrivateBrandUpgrade], list[MedlineConversion], list[int], str]:
+    """Run the three live signals against the cart and return suggestions.
+
+    If cart_items is None or empty, reads the customer's active cart from
+    Postgres (cart_items table, status='in_cart') and uses that.
+
+    Returns a 5-tuple:
+        (complements, pb_upgrades, conversions, effective_cart_items, cart_source)
+
+    cart_source is one of:
+        'request_body'   -> cart_items was passed in by the caller
+        'postgres_cart'  -> cart was read from the cart_items table
+        'empty'          -> no cart_items provided AND nothing in Postgres cart
+    """
+    # Resolve which cart_items to use
+    if cart_items:
+        effective_items = [int(i) for i in cart_items if i]
+        cart_source = "request_body"
+    else:
+        effective_items = await _read_active_cart_from_db(db, cust_id)
+        cart_source = "postgres_cart" if effective_items else "empty"
+
+    # If still empty after both paths, return empty results immediately.
+    if not effective_items:
+        return [], [], [], [], cart_source
 
     try:
-        comp_df = _query_cart_complements(cart_items, n=5)
+        comp_df = _query_cart_complements(effective_items, n=5)
     except Exception:
         comp_df = pd.DataFrame()
 
     try:
-        pb_df = _query_pb_upgrades(cart_items, n=3)
+        pb_df = _query_pb_upgrades(effective_items, n=3)
     except Exception:
         pb_df = pd.DataFrame()
 
     try:
-        med_df = _query_medline_conversions(cart_items, n=3)
+        med_df = _query_medline_conversions(effective_items, n=3)
     except Exception:
         med_df = pd.DataFrame()
 
@@ -492,4 +538,4 @@ async def get_cart_helper(
             pitch_reason=pitch,
         ))
 
-    return complements, pb_upgrades, conversions
+    return complements, pb_upgrades, conversions, effective_items, cart_source

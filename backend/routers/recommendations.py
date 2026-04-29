@@ -147,12 +147,15 @@ async def cart_helper(
             detail=f"Unrecognised role: {user.role}",
         )
 
-    complements, pb_upgrades, conversions = await recommendation_service.get_cart_helper(
-        db, cust_id, body.cart_items
+    complements, pb_upgrades, conversions, effective_items, cart_source = (
+        await recommendation_service.get_cart_helper(
+            db, cust_id, body.cart_items
+        )
     )
     return CartHelperResponse(
         cust_id=cust_id,
-        cart_size=len(body.cart_items),
+        cart_size=len(effective_items),
+        cart_source=cart_source,
         cart_complements=complements,
         private_brand_upgrades=pb_upgrades,
         medline_conversions=conversions,

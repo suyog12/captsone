@@ -38,17 +38,36 @@ class RecommendationsResponse(BaseModel):
     recommendations: list[RecommendationItem]
 
 
-# ---- Cart helper ----
+#  Cart helper 
 
 class CartHelperRequest(BaseModel):
-    """Request body for POST /recommendations/cart-helper."""
+    """Request body for POST /recommendations/cart-helper.
+
+    Two ways to call this endpoint:
+
+    1. Pass cust_id only. The endpoint will read the customer's active
+       in_cart items from Postgres and use those.
+       Example: {"cust_id": 13479955}
+
+    2. Pass cust_id AND cart_items. The endpoint will use the provided
+       list directly (this is the original behavior, kept for backward
+       compatibility and for use cases where the frontend is tracking
+       cart state in memory rather than persisting it).
+       Example: {"cust_id": 13479955, "cart_items": [21969, 486974]}
+
+    If cart_items is provided and non-empty, it takes precedence over
+    whatever is in Postgres.
+    """
 
     cust_id: int = Field(..., description="The customer whose cart this is")
-    cart_items: list[int] = Field(
-        ...,
-        min_length=1,
+    cart_items: Optional[list[int]] = Field(
+        default=None,
         max_length=50,
-        description="Item IDs currently in the cart",
+        description=(
+            "Optional list of item IDs currently in the cart. If omitted, "
+            "the endpoint reads the customer's active in_cart items from "
+            "Postgres. If provided, must contain 1 to 50 item IDs."
+        ),
     )
 
 
@@ -105,12 +124,22 @@ class CartHelperResponse(BaseModel):
 
     cust_id: int
     cart_size: int
+    cart_source: Literal["request_body", "postgres_cart", "empty"] = Field(
+        "request_body",
+        description=(
+            "Where the cart contents came from. "
+            "'request_body' means the caller passed cart_items explicitly. "
+            "'postgres_cart' means the endpoint read the customer's active "
+            "in_cart items from the cart_items table. "
+            "'empty' means the customer has no items in cart and none were passed."
+        ),
+    )
     cart_complements: list[CartComplement]
     private_brand_upgrades: list[PrivateBrandUpgrade]
     medline_conversions: list[MedlineConversion]
 
 
-# ---- Purchase history ----
+#  Purchase history 
 
 class PurchaseLine(BaseModel):
     """One line from recdash.purchase_history (with product description joined in)."""

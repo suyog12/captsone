@@ -52,6 +52,18 @@ SIZE_TIER_SMALL_MAX  = 500
 SIZE_TIER_MID_MAX    = 2_500
 SIZE_TIER_LARGE_MAX  = 15_000
 
+# 2D size tier configuration
+USE_2D_SIZE_TIER = True
+DOWNGRADE_RULE   = "max_one"
+
+# Volume thresholds (median monthly PRMRY_QTY in primary units of measure)
+SIZE_TIER_VOL_SMALL_MAX = 1_600
+SIZE_TIER_VOL_MID_MAX   = 9_050
+SIZE_TIER_VOL_LARGE_MAX = 92_500
+
+VOLUME_QTY_COL      = "PRMRY_QTY"
+VOLUME_QTY_FALLBACK = "SHIP_QTY"
+
 # New customer definition
 MIN_ACTIVE_MONTHS_FOR_TIER = 2
 
@@ -1133,7 +1145,7 @@ def step6b_patch_category_features(
     return features
 
 
-# Step 6c: Compute size tier and affordability ceiling
+# Step 6c: Compute size tier and affordability ceiling (2D: spend + volume)
 
 def step6c_size_tier_and_affordability(
     features:    pd.DataFrame,
@@ -1144,61 +1156,68 @@ def step6c_size_tier_and_affordability(
     if not merged_path.exists():
         _log("merged_dataset.parquet not found — skipping size tier")
         features["median_monthly_spend"]    = 0.0
+        features["median_monthly_volume"]   = 0.0
         features["active_months_last_12"]   = 0
+        features["spend_tier"]              = "new"
+        features["volume_tier"]             = "new"
         features["size_tier"]               = "new"
         features["affordability_ceiling"]   = 0.0
         return features
 
+    if USE_2D_SIZE_TIER:
+        _log(f"Using 2D size tier logic (rule: {DOWNGRADE_RULE})")
+        _log(f"  Spend thresholds:  small<{SIZE_TIER_SMALL_MAX} "
+             f"mid<{SIZE_TIER_MID_MAX} large<{SIZE_TIER_LARGE_MAX}")
+        _log(f"  Volume thresholds: small<{SIZE_TIER_VOL_SMALL_MAX} "
+             f"mid<{SIZE_TIER_VOL_MID_MAX} large<{SIZE_TIER_VOL_LARGE_MAX}")
+    else:
+        _log("Using monetary-only size tier logic (USE_2D_SIZE_TIER = False)")
+
     con = _con(memory_gb=5, threads=2)
 
-    # Compute monthly spend per customer per year-month
-    _log("Computing monthly spend per customer...")
-    monthly_spend = con.execute(f"""
+    # Compute monthly spend AND monthly volume per customer per year-month
+    _log("Computing monthly spend and volume per customer...")
+    qty_expr = (
+        f"GREATEST(0, COALESCE(NULLIF({VOLUME_QTY_COL}, 0), "
+        f"{VOLUME_QTY_FALLBACK}, 0))"
+    )
+    monthly = con.execute(f"""
         SELECT
-            CAST(DIM_CUST_CURR_ID AS BIGINT)                 AS cust_id,
+            CAST(DIM_CUST_CURR_ID AS BIGINT)  AS cust_id,
             order_year,
             order_month,
-            SUM(UNIT_SLS_AMT)                                 AS month_spend
+            SUM(UNIT_SLS_AMT)                  AS month_spend,
+            SUM({qty_expr})                    AS month_volume
         FROM read_parquet('{merged_path.as_posix()}')
         WHERE UNIT_SLS_AMT > 0
           AND DIM_CUST_CURR_ID IS NOT NULL
         GROUP BY CAST(DIM_CUST_CURR_ID AS BIGINT), order_year, order_month
     """).df()
+    _log(f"Monthly rows: {len(monthly):,}")
 
-    _log(f"Monthly spend rows: {len(monthly_spend):,}")
-
-    # Compute median monthly spend and active months per customer
+    # Compute median monthly spend and volume per customer
     size_stats = (
-        monthly_spend.groupby("cust_id")["month_spend"]
-        .agg(["median", "count"])
+        monthly.groupby("cust_id")
+        .agg(
+            median_monthly_spend  = ("month_spend",  "median"),
+            median_monthly_volume = ("month_volume", "median"),
+            active_months_total   = ("month_spend",  "count"),
+        )
         .reset_index()
-        .rename(columns={
-            "median": "median_monthly_spend",
-            "count":  "active_months_total",
-        })
     )
-    size_stats["median_monthly_spend"] = size_stats["median_monthly_spend"].round(2)
-
+    size_stats["median_monthly_spend"]  = size_stats["median_monthly_spend"].round(2)
+    size_stats["median_monthly_volume"] = size_stats["median_monthly_volume"].round(2)
     _log(f"Customers with spending history: {len(size_stats):,}")
-    _log(f"  median_monthly_spend p25:    ${size_stats['median_monthly_spend'].quantile(0.25):,.2f}")
-    _log(f"  median_monthly_spend median: ${size_stats['median_monthly_spend'].median():,.2f}")
-    _log(f"  median_monthly_spend p75:    ${size_stats['median_monthly_spend'].quantile(0.75):,.2f}")
-    _log(f"  median_monthly_spend p95:    ${size_stats['median_monthly_spend'].quantile(0.95):,.2f}")
-    _log(f"  median_monthly_spend max:    ${size_stats['median_monthly_spend'].max():,.2f}")
 
-    # Count active months in the last 12 months only
+    # Active months in the last 12 months
     max_ym = con.execute(f"""
         SELECT MAX(order_year * 100 + order_month)
         FROM read_parquet('{merged_path.as_posix()}')
         WHERE UNIT_SLS_AMT > 0
     """).fetchone()[0]
-
     max_year  = int(max_ym // 100)
     max_month = int(max_ym % 100)
     cutoff_minus_12 = max_year * 100 + max_month - 100
-
-    _log(f"Dataset max year-month: {max_year}-{max_month:02d}")
-    _log(f"Active months counted from: year-month {cutoff_minus_12}")
 
     active_last_12 = con.execute(f"""
         SELECT
@@ -1210,16 +1229,15 @@ def step6c_size_tier_and_affordability(
           AND (order_year * 100 + order_month) > {cutoff_minus_12}
         GROUP BY CAST(DIM_CUST_CURR_ID AS BIGINT)
     """).df()
-
     con.close()
 
-    _log(f"Customers active in last 12 months: {len(active_last_12):,}")
-
     size_stats = size_stats.merge(active_last_12, on="cust_id", how="left")
-    size_stats["active_months_last_12"] = size_stats["active_months_last_12"].fillna(0).astype(int)
+    size_stats["active_months_last_12"] = (
+        size_stats["active_months_last_12"].fillna(0).astype(int)
+    )
 
-    # Assign size_tier
-    def _classify_size(row) -> str:
+    # Classify each dimension separately
+    def _classify_spend(row) -> str:
         if row["active_months_last_12"] < MIN_ACTIVE_MONTHS_FOR_TIER:
             return "new"
         m = row["median_monthly_spend"]
@@ -1231,9 +1249,52 @@ def step6c_size_tier_and_affordability(
             return "large"
         return "enterprise"
 
-    size_stats["size_tier"] = size_stats.apply(_classify_size, axis=1)
+    def _classify_volume(row) -> str:
+        if row["active_months_last_12"] < MIN_ACTIVE_MONTHS_FOR_TIER:
+            return "new"
+        v = row["median_monthly_volume"]
+        if v < SIZE_TIER_VOL_SMALL_MAX:
+            return "small"
+        if v < SIZE_TIER_VOL_MID_MAX:
+            return "mid"
+        if v < SIZE_TIER_VOL_LARGE_MAX:
+            return "large"
+        return "enterprise"
 
-    # Compute affordability_ceiling
+    size_stats["spend_tier"]  = size_stats.apply(_classify_spend,  axis=1)
+    size_stats["volume_tier"] = size_stats.apply(_classify_volume, axis=1)
+
+    # Combine into final size_tier
+    TIER_RANK = {"new": 0, "small": 1, "mid": 2, "large": 3, "enterprise": 4}
+    RANK_TIER = {v: k for k, v in TIER_RANK.items()}
+
+    if not USE_2D_SIZE_TIER:
+        size_stats["size_tier"] = size_stats["spend_tier"]
+    elif DOWNGRADE_RULE == "pure_2d":
+        size_stats["size_tier"] = size_stats.apply(
+            lambda r: RANK_TIER[min(
+                TIER_RANK[r["spend_tier"]],
+                TIER_RANK[r["volume_tier"]],
+            )],
+            axis=1,
+        )
+    elif DOWNGRADE_RULE == "max_one":
+        def _combine_max_one(row):
+            spend_rank  = TIER_RANK[row["spend_tier"]]
+            volume_rank = TIER_RANK[row["volume_tier"]]
+            if row["spend_tier"] == "new":
+                return "new"
+            min_rank   = min(spend_rank, volume_rank)
+            final_rank = max(min_rank, spend_rank - 1)
+            return RANK_TIER[final_rank]
+        size_stats["size_tier"] = size_stats.apply(_combine_max_one, axis=1)
+    else:
+        raise ValueError(
+            f"Unknown DOWNGRADE_RULE '{DOWNGRADE_RULE}'. "
+            f"Use 'max_one' or 'pure_2d'."
+        )
+
+    # Affordability ceiling (still spend-based)
     size_stats["affordability_multiplier"] = (
         size_stats["size_tier"].map(AFFORDABILITY_MULTIPLIER)
     )
@@ -1241,13 +1302,58 @@ def step6c_size_tier_and_affordability(
         size_stats["median_monthly_spend"] * size_stats["affordability_multiplier"]
     ).round(2)
 
-    tier_counts = size_stats["size_tier"].value_counts()
+    # Diagnostic logging
     _log("")
-    _log("Size tier distribution:")
+    _log("Spend tier distribution (raw, before combination):")
+    spend_counts = size_stats["spend_tier"].value_counts()
     for tier in ["new", "small", "mid", "large", "enterprise"]:
-        count = int(tier_counts.get(tier, 0))
-        pct = round(count / len(size_stats) * 100, 2) if len(size_stats) else 0
-        _log(f"  {tier:<12} {count:>8,} customers  ({pct}%)")
+        c   = int(spend_counts.get(tier, 0))
+        pct = round(c / len(size_stats) * 100, 2) if len(size_stats) else 0
+        _log(f"  {tier:<12} {c:>8,} ({pct}%)")
+
+    _log("")
+    _log("Volume tier distribution (raw, before combination):")
+    vol_counts = size_stats["volume_tier"].value_counts()
+    for tier in ["new", "small", "mid", "large", "enterprise"]:
+        c   = int(vol_counts.get(tier, 0))
+        pct = round(c / len(size_stats) * 100, 2) if len(size_stats) else 0
+        _log(f"  {tier:<12} {c:>8,} ({pct}%)")
+
+    _log("")
+    if USE_2D_SIZE_TIER:
+        _log(f"Final size_tier distribution (rule: {DOWNGRADE_RULE}):")
+    else:
+        _log("Final size_tier distribution (monetary-only):")
+    final_counts = size_stats["size_tier"].value_counts()
+    for tier in ["new", "small", "mid", "large", "enterprise"]:
+        c   = int(final_counts.get(tier, 0))
+        pct = round(c / len(size_stats) * 100, 2) if len(size_stats) else 0
+        _log(f"  {tier:<12} {c:>8,} ({pct}%)")
+
+    if USE_2D_SIZE_TIER:
+        _log("")
+        _log("2D crosstab: spend_tier (rows) x volume_tier (cols):")
+        ctab = pd.crosstab(
+            size_stats["spend_tier"],
+            size_stats["volume_tier"],
+        ).reindex(
+            index=["new", "small", "mid", "large", "enterprise"],
+            columns=["new", "small", "mid", "large", "enterprise"],
+            fill_value=0,
+        )
+        header = "  " + " " * 13 + "  ".join(f"{c:>10}" for c in ctab.columns)
+        _log(header)
+        for row_label, row in ctab.iterrows():
+            line = f"  {row_label:<12}" + "  ".join(
+                f"{int(v):>10,}" for v in row
+            )
+            _log(line)
+
+        n_diff   = int((size_stats["size_tier"] != size_stats["spend_tier"]).sum())
+        pct_diff = round(n_diff / len(size_stats) * 100, 2)
+        _log("")
+        _log(f"Customers where size_tier != spend_tier (changed by 2D rule): "
+             f"{n_diff:,} ({pct_diff}%)")
 
     # Merge into features DataFrame
     features = features.copy()
@@ -1256,29 +1362,37 @@ def step6c_size_tier_and_affordability(
 
     features = features.merge(
         size_stats[[
-            "cust_id", "median_monthly_spend", "active_months_last_12",
-            "size_tier", "affordability_ceiling"
+            "cust_id",
+            "median_monthly_spend",
+            "median_monthly_volume",
+            "active_months_last_12",
+            "spend_tier",
+            "volume_tier",
+            "size_tier",
+            "affordability_ceiling",
         ]].rename(columns={"cust_id": "DIM_CUST_CURR_ID_int"}),
-        on="DIM_CUST_CURR_ID_int", how="left"
+        on="DIM_CUST_CURR_ID_int", how="left",
     )
 
     features["median_monthly_spend"]  = features["median_monthly_spend"].fillna(0.0)
+    features["median_monthly_volume"] = features["median_monthly_volume"].fillna(0.0)
     features["active_months_last_12"] = features["active_months_last_12"].fillna(0).astype(int)
+    features["spend_tier"]            = features["spend_tier"].fillna("new")
+    features["volume_tier"]           = features["volume_tier"].fillna("new")
     features["size_tier"]             = features["size_tier"].fillna("new")
     features["affordability_ceiling"] = features["affordability_ceiling"].fillna(0.0)
-
     features = features.drop(columns=["DIM_CUST_CURR_ID_int"])
 
     _log("")
-    _log(f"Affordability ceiling distribution:")
-    _log(f"  p25:    ${features['affordability_ceiling'].quantile(0.25):,.2f}")
-    _log(f"  median: ${features['affordability_ceiling'].median():,.2f}")
-    _log(f"  p75:    ${features['affordability_ceiling'].quantile(0.75):,.2f}")
-    _log(f"  p95:    ${features['affordability_ceiling'].quantile(0.95):,.2f}")
+    _log("Affordability ceiling distribution:")
+    for q, label in [(0.25, "p25"), (0.50, "p50"), (0.75, "p75"), (0.95, "p95")]:
+        v = features["affordability_ceiling"].quantile(q)
+        _log(f"  {label}: ${v:>12,.2f}")
 
     out = OUT_FEATURES / "customer_features.parquet"
     features.to_parquet(out, index=False)
-    _log(f"Saved  : {out.relative_to(ROOT)}  (with size_tier and affordability)")
+    _log("")
+    _log(f"Saved  : {out.relative_to(ROOT)}")
 
     return features
 
@@ -1615,16 +1729,53 @@ def step9_write_audit(
         st = features["size_tier"].value_counts().reset_index()
         st.columns = ["size_tier", "customer_count"]
         st["pct_of_total"] = (st["customer_count"] / st["customer_count"].sum() * 100).round(2)
-        st["rule_applied"] = st["size_tier"].map({
-            "new":        f"active_months_last_12 < {MIN_ACTIVE_MONTHS_FOR_TIER}",
-            "small":      f"median_monthly_spend < ${SIZE_TIER_SMALL_MAX:,}",
-            "mid":        f"${SIZE_TIER_SMALL_MAX:,} <= median_monthly_spend < ${SIZE_TIER_MID_MAX:,}",
-            "large":      f"${SIZE_TIER_MID_MAX:,} <= median_monthly_spend < ${SIZE_TIER_LARGE_MAX:,}",
-            "enterprise": f"median_monthly_spend >= ${SIZE_TIER_LARGE_MAX:,}",
-        })
+        if USE_2D_SIZE_TIER:
+            st["rule_applied"] = st["size_tier"].map({
+                "new":        f"active_months_last_12 < {MIN_ACTIVE_MONTHS_FOR_TIER}",
+                "small":      f"min(spend_tier, volume_tier) = small",
+                "mid":        f"min(spend_tier, volume_tier) = mid",
+                "large":      f"min(spend_tier, volume_tier) = large",
+                "enterprise": f"min(spend_tier, volume_tier) = enterprise",
+            })
+            st["combination_rule"] = DOWNGRADE_RULE
+        else:
+            st["rule_applied"] = st["size_tier"].map({
+                "new":        f"active_months_last_12 < {MIN_ACTIVE_MONTHS_FOR_TIER}",
+                "small":      f"median_monthly_spend < ${SIZE_TIER_SMALL_MAX:,}",
+                "mid":        f"${SIZE_TIER_SMALL_MAX:,} <= median_monthly_spend < ${SIZE_TIER_MID_MAX:,}",
+                "large":      f"${SIZE_TIER_MID_MAX:,} <= median_monthly_spend < ${SIZE_TIER_LARGE_MAX:,}",
+                "enterprise": f"median_monthly_spend >= ${SIZE_TIER_LARGE_MAX:,}",
+            })
+            st["combination_rule"] = "monetary_only"
     else:
         st = pd.DataFrame([{"note": "size_tier not found"}])
     _save_audit(st, OUT_AUDIT / "08c_size_tier_distribution.xlsx", "Size Tier")
+
+    # 2D crosstab and tier-change audit (only when 2D enabled)
+    if USE_2D_SIZE_TIER and "spend_tier" in features.columns and "volume_tier" in features.columns:
+        ctab = pd.crosstab(
+            features["spend_tier"],
+            features["volume_tier"],
+            margins=True,
+            margins_name="TOTAL",
+        ).reindex(
+            index=["new", "small", "mid", "large", "enterprise", "TOTAL"],
+            columns=["new", "small", "mid", "large", "enterprise", "TOTAL"],
+            fill_value=0,
+        ).reset_index()
+        _save_audit(ctab, OUT_AUDIT / "08d_spend_volume_crosstab.xlsx", "2D Crosstab")
+
+        breakdown = pd.crosstab(
+            features["spend_tier"],
+            features["size_tier"],
+            margins=True,
+            margins_name="TOTAL",
+        ).reindex(
+            index=["new", "small", "mid", "large", "enterprise", "TOTAL"],
+            columns=["new", "small", "mid", "large", "enterprise", "TOTAL"],
+            fill_value=0,
+        ).reset_index()
+        _save_audit(breakdown, OUT_AUDIT / "08e_size_tier_changes.xlsx", "Tier Changes")
 
     _save_audit(
         pd.DataFrame(run_log) if run_log else pd.DataFrame(),
@@ -1732,13 +1883,29 @@ def step9b_excel_report(
 
         if "size_tier" in features.columns:
             st_counts = features["size_tier"].value_counts()
-            st_rows = pd.DataFrame([
-                ("SIZE", "New customers (<2 months active)",  f"{int(st_counts.get('new', 0)):,}"),
-                ("SIZE", "Small tier customers",              f"{int(st_counts.get('small', 0)):,}"),
-                ("SIZE", "Mid tier customers",                f"{int(st_counts.get('mid', 0)):,}"),
-                ("SIZE", "Large tier customers",              f"{int(st_counts.get('large', 0)):,}"),
-                ("SIZE", "Enterprise tier customers",         f"{int(st_counts.get('enterprise', 0)):,}"),
-            ], columns=["category", "metric", "value"])
+            if USE_2D_SIZE_TIER:
+                n_changed = int((features["size_tier"] != features["spend_tier"]).sum()) \
+                    if "spend_tier" in features.columns else 0
+                pct_changed = round(100 * n_changed / len(features), 2) if len(features) else 0
+                st_rows = pd.DataFrame([
+                    ("SIZE", "Classification rule",
+                     f"2D ({DOWNGRADE_RULE} - lower of spend_tier and volume_tier)"),
+                    ("SIZE", "New customers (<2 months active)",  f"{int(st_counts.get('new', 0)):,}"),
+                    ("SIZE", "Small tier customers",              f"{int(st_counts.get('small', 0)):,}"),
+                    ("SIZE", "Mid tier customers",                f"{int(st_counts.get('mid', 0)):,}"),
+                    ("SIZE", "Large tier customers",              f"{int(st_counts.get('large', 0)):,}"),
+                    ("SIZE", "Enterprise tier customers",         f"{int(st_counts.get('enterprise', 0)):,}"),
+                    ("SIZE", "Customers downgraded by 2D rule",   f"{n_changed:,} ({pct_changed}%)"),
+                ], columns=["category", "metric", "value"])
+            else:
+                st_rows = pd.DataFrame([
+                    ("SIZE", "Classification rule",               "Monetary-only (legacy)"),
+                    ("SIZE", "New customers (<2 months active)",  f"{int(st_counts.get('new', 0)):,}"),
+                    ("SIZE", "Small tier customers",              f"{int(st_counts.get('small', 0)):,}"),
+                    ("SIZE", "Mid tier customers",                f"{int(st_counts.get('mid', 0)):,}"),
+                    ("SIZE", "Large tier customers",              f"{int(st_counts.get('large', 0)):,}"),
+                    ("SIZE", "Enterprise tier customers",         f"{int(st_counts.get('enterprise', 0)):,}"),
+                ], columns=["category", "metric", "value"])
             summary = pd.concat([summary, st_rows], ignore_index=True)
 
         summary.to_excel(writer, sheet_name="01_pipeline_summary", index=False)
@@ -1865,6 +2032,7 @@ def step10_summary(
         print("  Size tier distribution:")
         for t in ["new", "small", "mid", "large", "enterprise"]:
             print(f"    {t:<12} {int(st.get(t, 0)):>8,}")
+
 
 # Main
 

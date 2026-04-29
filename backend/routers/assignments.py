@@ -189,6 +189,40 @@ async def assignment_history(
     )
 
 
+# Read: seller's own customers
+
+@router.get(
+    "/sellers/me/customers",
+    response_model=SellerCustomerListResponse,
+    summary="Convenience: the logged-in seller's own customer list",
+)
+async def list_my_customers(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SellerCustomerListResponse:
+    if user.role != "seller":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is for sellers only. Admins should use /sellers/{id}/customers.",
+        )
+
+    customers, total = await assignment_service.list_for_seller(
+        db, seller_id=user.user_id, limit=limit, offset=offset
+    )
+    items = [
+        CustomerSearchResult.model_validate(c).model_dump()
+        for c in customers
+    ]
+    return SellerCustomerListResponse(
+        seller_id=user.user_id,
+        seller_username=user.username,
+        total=total,
+        items=items,
+    )
+
+
 # Read: list customers for a seller (admin-or-self)
 
 @router.get(
@@ -236,38 +270,6 @@ async def list_seller_customers(
     return SellerCustomerListResponse(
         seller_id=user_id,
         seller_username=target.username,
-        total=total,
-        items=items,
-    )
-
-
-@router.get(
-    "/sellers/me/customers",
-    response_model=SellerCustomerListResponse,
-    summary="Convenience: the logged-in seller's own customer list",
-)
-async def list_my_customers(
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> SellerCustomerListResponse:
-    if user.role != "seller":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint is for sellers only. Admins should use /sellers/{id}/customers.",
-        )
-
-    customers, total = await assignment_service.list_for_seller(
-        db, seller_id=user.user_id, limit=limit, offset=offset
-    )
-    items = [
-        CustomerSearchResult.model_validate(c).model_dump()
-        for c in customers
-    ]
-    return SellerCustomerListResponse(
-        seller_id=user.user_id,
-        seller_username=user.username,
         total=total,
         items=items,
     )

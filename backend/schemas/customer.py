@@ -15,6 +15,8 @@ class CustomerResponse(BaseModel):
     market_code: Optional[str] = None
     segment: Optional[str] = None
     supplier_profile: Optional[str] = None
+    status: Optional[str] = None
+    archetype: Optional[str] = None
     assigned_seller_id: Optional[int] = None
     assigned_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -30,6 +32,8 @@ class CustomerSearchResult(BaseModel):
     specialty_code: Optional[str] = None
     market_code: Optional[str] = None
     segment: Optional[str] = None
+    status: Optional[str] = None
+    archetype: Optional[str] = None
     assigned_seller_id: Optional[int] = None
 
     model_config = {"from_attributes": True}

@@ -786,8 +786,8 @@ def print_terminal_report(reports: list) -> None:
 
         print(f"\n  RECENT ORDERS + CART SIMULATIONS:")
         for order in rep["order_simulations"]:
-            print(f"\n  --- ORDER #{order['order_rank']} ({order['order_date']}, "
-                  f"${order['order_total']:,.0f}, {order['line_count']} lines) ---")
+            print(f"\n ORDER #{order['order_rank']} ({order['order_date']}, "
+                  f"${order['order_total']:,.0f}, {order['line_count']} lines)")
             print(f"    Items in this order:")
             for item in order["items"][:5]:
                 pb_tag = " [PB]" if item["is_pb"] else ""
@@ -1574,8 +1574,8 @@ def save_text_report(reports: list, recs_full: pd.DataFrame) -> None:
         lines.append("  RECENT ORDERS WITH CART-AWARE RECOMMENDATIONS:")
         for order in rep["order_simulations"]:
             lines.append("")
-            lines.append(f"  --- ORDER #{order['order_rank']} ({order['order_date']}, "
-                         f"${order['order_total']:,.0f}, {order['line_count']} lines) ---")
+            lines.append(f" ORDER #{order['order_rank']} ({order['order_date']}, "
+                         f"${order['order_total']:,.0f}, {order['line_count']} lines)")
             lines.append(f"    Items in this order:")
             for item in order["items"]:
                 pb_tag = " [PB]" if item["is_pb"] else ""

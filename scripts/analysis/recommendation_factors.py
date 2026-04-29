@@ -1370,8 +1370,8 @@ def diversified_combine(rec_dfs: list) -> pd.DataFrame:
     combined = pd.concat(aligned_dfs, ignore_index=True)
     _log(f"  Combined candidates: {len(combined):,}")
 
-    # ---- Phase 5 fix #2: specialty mismatch filter (before dedup so we don't
-    # accidentally promote a mismatch rec by virtue of it appearing in 2 signals) ----
+    # Phase 5 fix #2: specialty mismatch filter (before dedup so we don't
+    # accidentally promote a mismatch rec by virtue of it appearing in 2 signals)
     if "n_unique_products_total" in combined.columns and "specialty_match" in combined.columns:
         n_before = len(combined)
         has_history = combined["n_unique_products_total"].fillna(0) >= SPECIALTY_FILTER_MIN_HISTORY
@@ -1391,7 +1391,7 @@ def diversified_combine(rec_dfs: list) -> pd.DataFrame:
     )
     _log(f"  After deduplication: {len(combined):,}")
 
-    # ---- Phase 5 fix #1: per-signal score normalization ----
+    # Phase 5 fix #1: per-signal score normalization
     # Compute a 0-1 percentile rank within each signal type. This becomes the
     # primary cross-signal comparison key. We keep numeric_score as well so
     # downstream consumers can still see the raw value and the within-signal

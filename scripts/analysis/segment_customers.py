@@ -161,6 +161,7 @@ def load_features():
         "category_hhi", "cycle_regularity",
         "median_monthly_spend", "active_months_last_12",
         "affordability_ceiling",
+        "median_monthly_volume", "spend_tier", "volume_tier",
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -190,7 +191,7 @@ def assign_segments(df):
 
     desc_map = {
         "new":        "New customer — safe high-adoption items only",
-        "small":      "Small customer — prioritize lapsed reorders",
+        "small":      "Small customer — limited budget, prioritize lapsed reorders",
         "mid":        "Mid-size customer — balanced cross-sell and reorders",
         "large":      "Large customer — cross-sell new categories",
         "enterprise": "Enterprise customer — aggressive cross-sell and expansion",
@@ -239,19 +240,20 @@ def build_segment_profiles(df):
     agg = (
         df.groupby("segment")
         .agg(
-            mkt_cd                = ("mkt_cd_clean",          "first"),
-            size_tier             = ("size_tier",             "first"),
-            n_customers           = ("DIM_CUST_CURR_ID",      "count"),
-            median_monetary       = ("monetary",              "median"),
-            median_monthly_spend  = ("median_monthly_spend",  "median"),
-            median_recency        = ("recency_days",          "median"),
-            median_frequency      = ("frequency",             "median"),
-            median_avg_order      = ("avg_revenue_per_order", "median"),
-            median_afford_ceiling = ("affordability_ceiling", "median"),
-            median_active_months  = ("active_months_last_12", "median"),
-            median_n_cats         = ("n_categories_bought",   "median"),
-            median_hhi            = ("category_hhi",          "median"),
-            median_cycle          = ("cycle_regularity",      "median"),
+            mkt_cd                 = ("mkt_cd_clean",          "first"),
+            size_tier              = ("size_tier",             "first"),
+            n_customers            = ("DIM_CUST_CURR_ID",      "count"),
+            median_monetary        = ("monetary",              "median"),
+            median_monthly_spend   = ("median_monthly_spend",  "median"),
+            median_monthly_volume  = ("median_monthly_volume", "median"),
+            median_recency         = ("recency_days",          "median"),
+            median_frequency       = ("frequency",             "median"),
+            median_avg_order       = ("avg_revenue_per_order", "median"),
+            median_afford_ceiling  = ("affordability_ceiling", "median"),
+            median_active_months   = ("active_months_last_12", "median"),
+            median_n_cats          = ("n_categories_bought",   "median"),
+            median_hhi             = ("category_hhi",          "median"),
+            median_cycle           = ("cycle_regularity",      "median"),
         )
         .reset_index()
     )

@@ -65,3 +65,49 @@ async def search(
 
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+async def search_by_filters(
+    db: AsyncSession,
+    *,
+    segment: Optional[str] = None,
+    status: Optional[str] = None,
+    archetype: Optional[str] = None,
+    market_code: Optional[str] = None,
+    specialty_code: Optional[str] = None,
+    seller_id: Optional[int] = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    offset: int = 0,
+) -> list[Customer]:
+    """
+    Filtered customer browsing for the dashboard.
+
+    All filters are optional and combined with AND. Useful for queries like:
+      - all churned customers (status='churned_warm')
+      - all surgery centers (archetype='surgery_center')
+      - declining LTC customers (status='declining_warm', segment='LTC_large')
+
+    For sellers, results are auto-scoped to their assigned customers via
+    seller_id parameter.
+    """
+    limit = min(max(limit, 1), MAX_SEARCH_LIMIT)
+
+    stmt = select(Customer)
+
+    if status is not None:
+        stmt = stmt.where(Customer.status == status)
+    if archetype is not None:
+        stmt = stmt.where(Customer.archetype == archetype)
+    if segment is not None:
+        stmt = stmt.where(Customer.segment == segment)
+    if market_code is not None:
+        stmt = stmt.where(Customer.market_code == market_code.upper())
+    if specialty_code is not None:
+        stmt = stmt.where(Customer.specialty_code == specialty_code.upper())
+    if seller_id is not None:
+        stmt = stmt.where(Customer.assigned_seller_id == seller_id)
+
+    stmt = stmt.order_by(Customer.cust_id).limit(limit).offset(offset)
+
+    result = await db.execute(stmt)
+    return list(result.scalars().all())

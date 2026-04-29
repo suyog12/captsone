@@ -10,10 +10,12 @@ from backend.db.database import engine
 from backend.routers import (
     assignments,
     auth,
+    cart,
     customers,
     health,
     purchase_history,
     recommendations,
+    stats,
     users,
 )
 
@@ -30,7 +32,7 @@ app = FastAPI(
     version=settings.api_version,
     debug=settings.api_debug,
     description=(
-        "API for the McKesson recommendation engine capstone project. "
+        "API for the recommendation dashboard capstone project. "
         "Reads precomputed recommendations from parquet files via DuckDB "
         "and live transactional state from Postgres via SQLAlchemy."
     ),
@@ -53,6 +55,8 @@ app.include_router(customers.router)
 app.include_router(purchase_history.router)
 app.include_router(recommendations.router)
 app.include_router(assignments.router)
+app.include_router(cart.router)
+app.include_router(stats.router)
 
 
 @app.get("/", tags=["root"])
