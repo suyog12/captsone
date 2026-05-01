@@ -10,12 +10,21 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from backend.models.base import Base
 
+
+# Recommendation event
+
+# Tracks every recommendation outcome - shown, purchased, or actively
+# rejected by a seller. The base row is created when the engine surfaces
+# a rec; later writes update outcome to 'purchased' (when a sold cart
+# line is sourced from a recommendation_*) or 'rejected' (when a seller
+# clicks Reject on the rec card and supplies a reason).
 
 class RecommendationEvent(Base):
     __tablename__ = "recommendation_events"
@@ -30,6 +39,7 @@ class RecommendationEvent(Base):
     cust_id:           Mapped[int] = mapped_column(BigInteger, nullable=False)
     item_id:           Mapped[int] = mapped_column(BigInteger, nullable=False)
     signal:            Mapped[Optional[str]] = mapped_column(String(40))
+    rec_purpose:       Mapped[Optional[str]] = mapped_column(String(40))
     rank:              Mapped[Optional[int]] = mapped_column(Integer)
     shown_to_user_id:  Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("users.user_id")
@@ -39,6 +49,13 @@ class RecommendationEvent(Base):
     )
     outcome:           Mapped[str] = mapped_column(String(20), default="pending")
     resolved_at:       Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Rejection-specific fields - populated when outcome = 'rejected'
+    rejected_by_user_id:    Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.user_id")
+    )
+    rejection_reason_code:  Mapped[Optional[str]] = mapped_column(String(50))
+    rejection_reason_note:  Mapped[Optional[str]] = mapped_column(Text)
 
     def __repr__(self) -> str:
         return (

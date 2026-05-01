@@ -42,7 +42,7 @@ Output:
     audit_columns.csv         - flat CSV of (layer, table, column, dtype, null_count)
 """
 
-# ---------- imports ----------
+# imports
 import argparse
 import os
 import sys
@@ -63,7 +63,7 @@ except ImportError:
     sys.exit(1)
 
 
-# ---------- config ----------
+# config
 LIKELY_RAW_PATHS = ["data_raw", "data/raw", "raw_data", "data_source"]
 LIKELY_CLEAN_PATHS = ["data_clean", "data/clean", "data_processed"]
 LIKELY_PRECOMPUTED_PATHS = [
@@ -79,7 +79,7 @@ SAMPLE_ROWS = 3
 STR_TRUNC = 80
 
 
-# ---------- discover logical tables ----------
+# discover logical tables
 def discover_logical_tables(root):
     """
     Walk root and group .parquet files by their containing folder.
@@ -156,7 +156,7 @@ def autodetect_paths(base_dir):
     return found
 
 
-# ---------- profile a logical table ----------
+# profile a logical table
 def profile_logical_table(con, table):
     """
     Profile one logical table (which may be partitioned across many shards).
@@ -301,7 +301,7 @@ def profile_logical_table(con, table):
     return info
 
 
-# ---------- formatting ----------
+# formatting
 def format_table_section(info, layer):
     lines = []
     partitioned_note = ""
@@ -367,7 +367,7 @@ def format_table_section(info, layer):
     return "\n".join(lines)
 
 
-# ---------- main ----------
+# main
 def main():
     parser = argparse.ArgumentParser(
         description="Audit raw + clean + precomputed parquet pipeline (handles partitioned datasets)."
@@ -478,7 +478,7 @@ def main():
     elapsed = round(time.time() - started, 2)
     print(f"\nProfiling complete in {elapsed}s. Building report...\n")
 
-    # ---------- detect derived columns ----------
+    # detect derived columns
     raw_cols = set()
     for info in all_layers_data.get("RAW (client-provided)", []):
         for c in info["columns"]:
@@ -510,7 +510,7 @@ def main():
     raw_used_in_pre = raw_cols & pre_cols
     raw_dropped = raw_cols - clean_cols - pre_cols
 
-    # ---------- write markdown ----------
+    # write markdown
     out = []
     out.append("# Capstone Data Pipeline Audit Report (v2)")
     out.append("")
@@ -539,7 +539,7 @@ def main():
             out.append(f"| `{d['name']}` | {d['shard_count']} | {(d['n_rows'] or 0):,} | {d['n_cols']} | {d['total_size_mb']} |")
         out.append("")
 
-    # ---------- derivation analysis ----------
+    # derivation analysis
     out.append("## Derivation Analysis")
     out.append("")
     out.append("Compares column names across layers. Auto-detection by name match — renamed columns may show up as 'derived' even if they're really cleaned versions of raw columns. Always cross-check with feature engineering scripts before defense.")
@@ -569,7 +569,7 @@ def main():
     out.append(", ".join(f"`{c}`" for c in sorted(pre_only)) if pre_only else "_(none)_")
     out.append("")
 
-    # ---------- per-table detail ----------
+    # per-table detail
     for layer, data in all_layers_data.items():
         if not data:
             continue

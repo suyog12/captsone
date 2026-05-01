@@ -13,6 +13,7 @@ from backend.routers import (
     cart,
     customers,
     health,
+    products,
     purchase_history,
     recommendations,
     stats,
@@ -56,6 +57,7 @@ app.include_router(purchase_history.router)
 app.include_router(recommendations.router)
 app.include_router(assignments.router)
 app.include_router(cart.router)
+app.include_router(products.router)
 app.include_router(stats.router)
 
 

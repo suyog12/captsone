@@ -288,18 +288,18 @@ def _query_cart_complements(cart_items: list[int], n: int = 5) -> pd.DataFrame:
         f"""
         WITH pairs AS (
             SELECT
-                item_a AS trigger_item_id,
-                item_b AS partner_item_id,
-                lift, support, confidence
+                product_a AS trigger_item_id,
+                product_b AS partner_item_id,
+                lift, support_ab AS support, confidence
             FROM read_parquet(?)
-            WHERE item_a IN ({placeholders})
+            WHERE product_a IN ({placeholders})
             UNION ALL
             SELECT
-                item_b AS trigger_item_id,
-                item_a AS partner_item_id,
-                lift, support, confidence
+                product_b AS trigger_item_id,
+                product_a AS partner_item_id,
+                lift, support_ab AS support, confidence
             FROM read_parquet(?)
-            WHERE item_b IN ({placeholders})
+            WHERE product_b IN ({placeholders})
         ),
         ranked AS (
             SELECT
@@ -323,28 +323,34 @@ def _query_cart_complements(cart_items: list[int], n: int = 5) -> pd.DataFrame:
         params,
     )
 
-
 def _query_pb_upgrades(cart_items: list[int], n: int = 3) -> pd.DataFrame:
-    """Find McKesson Brand alternatives for cart items."""
+    """Find McKesson Brand alternatives for cart items.
+
+    The Parquet file uses original_item_id / equivalent_item_id and
+    match_type ('private_brand_upgrade' | 'medline_conversion'). We
+    convert price_delta_pct (which is negative when cheaper, in 0-1
+    fraction units) into a positive savings percentage in 0-100 units
+    so the API contract stays unchanged.
+    """
     if not cart_items:
         return pd.DataFrame()
     placeholders = ",".join("?" for _ in cart_items)
     return duckdb_query(
         f"""
         SELECT
-            cart_item_id,
-            pb_item_id,
-            estimated_savings_pct,
-            pair_type
+            original_item_id  AS cart_item_id,
+            equivalent_item_id AS pb_item_id,
+            (-price_delta_pct) * 100 AS estimated_savings_pct,
+            match_type AS pair_type
         FROM read_parquet(?)
-        WHERE cart_item_id IN ({placeholders})
-          AND pair_type = 'pb_upgrade'
-        ORDER BY estimated_savings_pct DESC NULLS LAST
+        WHERE original_item_id IN ({placeholders})
+          AND match_type = 'private_brand_upgrade'
+          AND is_price_improvement = true
+        ORDER BY price_delta_pct ASC NULLS LAST
         LIMIT ?
         """,
         [str(PRIVATE_BRAND_FILE)] + [int(i) for i in cart_items] + [int(n)],
     )
-
 
 def _query_medline_conversions(cart_items: list[int], n: int = 3) -> pd.DataFrame:
     """Find McKesson alternatives for Medline cart items."""
@@ -354,19 +360,18 @@ def _query_medline_conversions(cart_items: list[int], n: int = 3) -> pd.DataFram
     return duckdb_query(
         f"""
         SELECT
-            cart_item_id AS medline_item_id,
-            pb_item_id AS mckesson_item_id,
-            estimated_savings_pct,
-            pair_type
+            original_item_id   AS medline_item_id,
+            equivalent_item_id AS mckesson_item_id,
+            (-price_delta_pct) * 100 AS estimated_savings_pct,
+            match_type AS pair_type
         FROM read_parquet(?)
-        WHERE cart_item_id IN ({placeholders})
-          AND pair_type = 'medline_conversion'
-        ORDER BY estimated_savings_pct DESC NULLS LAST
+        WHERE original_item_id IN ({placeholders})
+          AND match_type = 'medline_conversion'
+        ORDER BY price_delta_pct ASC NULLS LAST
         LIMIT ?
         """,
         [str(PRIVATE_BRAND_FILE)] + [int(i) for i in cart_items] + [int(n)],
     )
-
 
 async def _read_active_cart_from_db(
     db: AsyncSession, cust_id: int

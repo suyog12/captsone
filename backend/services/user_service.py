@@ -253,3 +253,59 @@ async def reactivate(db: AsyncSession, user_id: int) -> Optional[User]:
     await db.commit()
     await db.refresh(user)
     return user
+
+
+# ============================================================================
+# Create customer record only - no login (used by POST /customers/record)
+# ============================================================================
+
+async def create_customer_record_only(
+    db: AsyncSession,
+    *,
+    customer_business_name: str,
+    market_code: str,
+    size_tier: str,
+    specialty_code: Optional[str] = None,
+    assigned_seller_id: Optional[int] = None,
+    actor_user_id: int,
+) -> Customer:
+    """Create only a recdash.customers row, no User login.
+
+    Used when a seller adds a customer via the dashboard (auto-assigned to
+    that seller) or when an admin creates a record without a login.
+    """
+    next_cust_id = await _next_cust_id(db)
+
+    segment = None
+    if market_code and size_tier:
+        segment = f"{market_code}_{size_tier}"
+
+    customer = Customer(
+        cust_id=next_cust_id,
+        customer_name=customer_business_name,
+        specialty_code=specialty_code,
+        market_code=market_code,
+        segment=segment,
+        status="cold_start",
+        archetype="other",
+        assigned_seller_id=assigned_seller_id,
+        assigned_at=datetime.utcnow() if assigned_seller_id else None,
+        created_at=datetime.utcnow(),
+    )
+    db.add(customer)
+    await db.flush()
+
+    if assigned_seller_id is not None:
+        await assignment_service._record_history(
+            db,
+            cust_id=next_cust_id,
+            previous_seller_id=None,
+            new_seller_id=assigned_seller_id,
+            change_reason="customer_created",
+            changed_by_user_id=actor_user_id,
+            notes=None,
+        )
+
+    await db.commit()
+    await db.refresh(customer)
+    return customer

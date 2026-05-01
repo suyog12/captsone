@@ -1,43 +1,77 @@
-# Data processing
-duckdb>=1.0.0
-pandas>=2.0.0
-numpy>=1.24.0
-pyarrow>=14.0.0
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
 
-# Machine learning
-scikit-learn>=1.3.0
-scipy
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
 
-# Uncomment if you actually use these in scripts/analysis/
-implicit>=0.7.2
-lightgbm>=4.0.0
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
 
-# Visualization
-matplotlib>=3.7.0
+# Environment / secrets
+.env
+.env.local
+.env.production
+.env.*.local
+!.env.example
 
-# Excel output
-openpyxl>=3.1.0
+# Data files (these belong in S3/R2/Drive, NOT git)
+data_raw/
+data_clean/
+analysis_outputs/
+*.parquet
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
 
-# Feature attribution (feature_importance.py only)
-shap>=0.44.0
-joblib>=1.3.0
+# Generated reports (large CSVs and Excel files)
+rankings_report/
+*.csv
+!demo_picks_v2.csv
+api_test_report_*.xlsx
 
-# Database
-sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
-asyncpg>=0.29.0
+# Cleanup / one-off scripts
+cleanup.ps1
+cleanup_project.ps1
+inventory_project.ps1
 
-# FastAPI / web
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
-python-multipart>=0.0.9
+# Generated outputs
+*.log
+*.tmp
+*.bak
+*.bak2
+*.backup
 
-# Auth
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-bcrypt>=4.0.0
+# Archive (kept locally but not in repo)
+archive/
 
-# QC test runner (scripts/qc/run_api_tests.py)
-requests>=2.31.0
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local development scratch
+*~
+*.orig
+scratch/
+tmp/

@@ -37,6 +37,7 @@ from backend.models import (
     Inventory,
     Product,
     PurchaseHistory,
+    RecommendationEvent,
     User,
 )
 
@@ -109,7 +110,7 @@ def _split_segment_code(seg_code: Optional[str]) -> tuple[Optional[str], Optiona
 async def get_overview(db: AsyncSession) -> dict:
     """Return KPI numbers for the admin dashboard overview."""
 
-    # --- Customer population (Parquet) ---
+    # Customer population (Parquet)
     try:
         cust_df = duckdb_query(
             "SELECT COUNT(*) AS total FROM read_parquet(?)",
@@ -119,7 +120,7 @@ async def get_overview(db: AsyncSession) -> dict:
     except Exception:
         total_customers = 0
 
-    # --- Active accounts (Postgres users with role='customer') ---
+    # Active accounts (Postgres users with role='customer')
     active_accounts_q = await db.execute(
         select(func.count(User.user_id)).where(
             User.role == "customer",
@@ -128,7 +129,7 @@ async def get_overview(db: AsyncSession) -> dict:
     )
     active_accounts = int(active_accounts_q.scalar() or 0)
 
-    # --- New customer accounts in last 30 days ---
+    # New customer accounts in last 30 days
     # We count User records (login accounts) created in the last 30 days,
     # not Customer records, because the customers table was bulk-imported
     # with created_at = now, so it doesn't reflect real signup dates.
@@ -143,7 +144,7 @@ async def get_overview(db: AsyncSession) -> dict:
     )
     new_customers_30d = int(new_q.scalar() or 0)
 
-    # --- Products ---
+    # Products
     total_products_q = await db.execute(select(func.count(Product.item_id)))
     total_products = int(total_products_q.scalar() or 0)
 
@@ -155,12 +156,12 @@ async def get_overview(db: AsyncSession) -> dict:
     pb_products = int(pb_products_q.scalar() or 0)
     pb_pct = (pb_products / total_products * 100.0) if total_products > 0 else 0.0
 
-    # --- Sales in last 7/30/90 days ---
+    # Sales in last 7/30/90 days
     sales_7d = await _aggregate_sales_period(db, days=7, label="last 7 days")
     sales_30d = await _aggregate_sales_period(db, days=30, label="last 30 days")
     sales_90d = await _aggregate_sales_period(db, days=90, label="last 90 days")
 
-    # --- Active carts ---
+    # Active carts
     cart_q = await db.execute(
         select(
             func.count(CartItem.cart_item_id),
@@ -602,7 +603,7 @@ async def get_customer_stats(
     """Per-customer drilldown: header, summary, trend, top products, top families."""
     range_start, range_end, range_label = _resolve_range(range_str)
 
-    # --- Header ---
+    # Header
     customer = await db.get(Customer, cust_id)
     if customer is None:
         raise ValueError(f"Customer {cust_id} not found.")
@@ -643,7 +644,7 @@ async def get_customer_stats(
         "assigned_seller_username": seller_username,
     }
 
-    # --- Summary (across all-time, not range-limited) ---
+    # Summary (across all-time, not range-limited)
     rev_expr = func.coalesce(
         func.sum(PurchaseHistory.quantity * PurchaseHistory.unit_price), 0
     )
@@ -682,7 +683,7 @@ async def get_customer_stats(
 
     has_data = total_orders > 0
 
-    # --- Trend (range-limited) ---
+    # Trend (range-limited)
     bucket = _bucket_expr(granularity).label("bucket")
     trend_stmt = (
         select(
@@ -713,7 +714,7 @@ async def get_customer_stats(
             "quantity": int(r[3] or 0),
         })
 
-    # --- Top products (all-time for this customer) ---
+    # Top products (all-time for this customer)
     rev_p = func.coalesce(
         func.sum(PurchaseHistory.quantity * PurchaseHistory.unit_price), 0
     ).label("rev")
@@ -757,7 +758,7 @@ async def get_customer_stats(
             "order_count": int(r[5] or 0),
         })
 
-    # --- Top families ---
+    # Top families
     rev_f = func.coalesce(
         func.sum(PurchaseHistory.quantity * PurchaseHistory.unit_price), 0
     ).label("rev")
@@ -982,4 +983,252 @@ async def get_seller_stats(
         "trend": trend,
         "top_products": top_products,
         "top_families": top_families,
+    }
+
+# /admin/stats/top-customers
+
+async def get_top_customers(
+    db: AsyncSession,
+    *,
+    limit: int = 10,
+    range_str: RangeType = "all",
+) -> dict:
+    """
+    Leaderboard of customers ranked by total revenue in the given range.
+    """
+    range_start, range_end, range_label = _resolve_range(range_str)
+
+    date_filter = []
+    if range_start:
+        date_filter.append(PurchaseHistory.sold_at >= range_start)
+    if range_end:
+        date_filter.append(PurchaseHistory.sold_at <= range_end)
+
+    revenue_expr = func.sum(
+        PurchaseHistory.quantity * PurchaseHistory.unit_price
+    ).label("total_revenue")
+    orders_expr = func.count(PurchaseHistory.purchase_id.distinct()).label("total_orders")
+    qty_expr = func.sum(PurchaseHistory.quantity).label("total_quantity")
+    last_dt_expr = func.max(PurchaseHistory.sold_at).label("last_order_date")
+
+    stmt = (
+        select(
+            Customer.cust_id,
+            Customer.customer_name,
+            Customer.segment,
+            Customer.status,
+            Customer.archetype,
+            Customer.market_code,
+            Customer.specialty_code,
+            Customer.assigned_seller_id,
+            revenue_expr,
+            orders_expr,
+            qty_expr,
+            last_dt_expr,
+        )
+        .join(PurchaseHistory, PurchaseHistory.cust_id == Customer.cust_id)
+        .group_by(Customer.cust_id)
+        .order_by(revenue_expr.desc())
+        .limit(limit)
+    )
+
+    if date_filter:
+        stmt = stmt.where(*date_filter)
+
+    rows_result = await db.execute(stmt)
+    rows = []
+    for r in rows_result.all():
+        rows.append({
+            "cust_id": r[0],
+            "customer_name": r[1],
+            "segment": r[2],
+            "status": r[3],
+            "archetype": r[4],
+            "market_code": r[5],
+            "specialty_code": r[6],
+            "assigned_seller_id": r[7],
+            "total_revenue": Decimal(str(r[8] or 0)),
+            "total_orders": int(r[9] or 0),
+            "total_quantity": int(r[10] or 0),
+            "last_order_date": r[11],
+        })
+
+    return {
+        "range_label": range_label,
+        "range_start": range_start,
+        "range_end": range_end,
+        "rows": rows,
+    }
+
+# === engine_effectiveness appended ===
+
+# Map cart_items.source values to "signal" codes used in
+# recommendation_events.signal. Only recommendation_* sources participate.
+SOURCE_TO_SIGNAL = {
+    "recommendation_peer_gap":          "peer_gap",
+    "recommendation_popularity":        "popularity",
+    "recommendation_cart_complement":   "cart_complement",
+    "recommendation_item_similarity":   "item_similarity",
+    "recommendation_replenishment":     "replenishment",
+    "recommendation_lapsed":            "lapsed_recovery",
+    "recommendation_pb_upgrade":        "private_brand_upgrade",
+    "recommendation_medline_conversion":"medline_conversion",
+}
+
+SIGNAL_TO_SOURCE = {v: k for k, v in SOURCE_TO_SIGNAL.items()}
+
+SIGNAL_DISPLAY = {
+    "peer_gap":              "Peer Gap",
+    "popularity":            "Popular Pick",
+    "cart_complement":       "Cart Complement",
+    "item_similarity":       "Similar Item",
+    "replenishment":         "Replenishment",
+    "lapsed_recovery":       "Lapsed Recovery",
+    "private_brand_upgrade": "Private Brand Upgrade",
+    "medline_conversion":    "Medline Conversion",
+}
+
+
+async def get_engine_effectiveness(db: AsyncSession) -> dict:
+    """Per-signal funnel: adds -> sold + rejected. Plus reason breakdown."""
+    from decimal import Decimal as _Decimal
+
+    sold_expr = func.sum(
+        case((CartItem.status == "sold", 1), else_=0)
+    ).label("sold")
+    not_sold_expr = func.sum(
+        case((CartItem.status == "not_sold", 1), else_=0)
+    ).label("not_sold")
+    revenue_expr = func.coalesce(
+        func.sum(
+            case(
+                (CartItem.status == "sold",
+                 CartItem.quantity * CartItem.unit_price_at_add),
+                else_=0,
+            )
+        ),
+        0,
+    ).label("revenue")
+
+    cart_stmt = (
+        select(
+            CartItem.source,
+            func.count(CartItem.cart_item_id).label("adds"),
+            sold_expr,
+            not_sold_expr,
+            revenue_expr,
+        )
+        .group_by(CartItem.source)
+    )
+    cart_rows = (await db.execute(cart_stmt)).all()
+
+    cart_by_signal: dict = {}
+    for r in cart_rows:
+        src = r[0]
+        if not is_recommendation_source(src):
+            continue
+        signal = SOURCE_TO_SIGNAL.get(src)
+        if signal is None:
+            continue
+        cart_by_signal[signal] = {
+            "adds": int(r[1] or 0),
+            "sold": int(r[2] or 0),
+            "not_sold": int(r[3] or 0),
+            "revenue": _Decimal(str(r[4] or 0)),
+        }
+
+    rej_stmt = (
+        select(
+            RecommendationEvent.signal,
+            func.count(RecommendationEvent.event_id).label("rejected"),
+        )
+        .where(RecommendationEvent.outcome == "rejected")
+        .group_by(RecommendationEvent.signal)
+    )
+    rej_rows = (await db.execute(rej_stmt)).all()
+    rej_by_signal: dict = {}
+    for r in rej_rows:
+        sig = (r[0] or "").strip()
+        if not sig:
+            continue
+        rej_by_signal[sig] = int(r[1] or 0)
+
+    reason_stmt = (
+        select(
+            RecommendationEvent.rejection_reason_code,
+            func.count(RecommendationEvent.event_id),
+        )
+        .where(RecommendationEvent.outcome == "rejected")
+        .where(RecommendationEvent.rejection_reason_code.isnot(None))
+        .group_by(RecommendationEvent.rejection_reason_code)
+    )
+    reason_rows = (await db.execute(reason_stmt)).all()
+    reasons = [
+        {"code": r[0], "count": int(r[1] or 0)}
+        for r in reason_rows
+    ]
+    reasons.sort(key=lambda x: x["count"], reverse=True)
+
+    all_signals = set(cart_by_signal.keys()) | set(rej_by_signal.keys())
+    rows = []
+    totals = {
+        "adds": 0, "sold": 0, "not_sold": 0, "rejected": 0,
+        "revenue": _Decimal("0"),
+    }
+    for sig in sorted(all_signals):
+        cart = cart_by_signal.get(sig, {
+            "adds": 0, "sold": 0, "not_sold": 0, "revenue": _Decimal("0")
+        })
+        rejected = rej_by_signal.get(sig, 0)
+        engaged = cart["adds"] + rejected
+
+        conversion_pct = round(cart["sold"] / cart["adds"] * 100.0, 2) if cart["adds"] > 0 else 0.0
+        acceptance_pct = round(cart["adds"] / engaged * 100.0, 2) if engaged > 0 else 0.0
+        rejection_pct = round(rejected / engaged * 100.0, 2) if engaged > 0 else 0.0
+
+        rows.append({
+            "signal": {
+                "code": sig,
+                "display_name": SIGNAL_DISPLAY.get(sig, sig.replace("_", " ").title()),
+            },
+            "cart_adds": cart["adds"],
+            "sold": cart["sold"],
+            "not_sold_cart": cart["not_sold"],
+            "rejected": rejected,
+            "engaged": engaged,
+            "conversion_rate_pct": conversion_pct,
+            "acceptance_rate_pct": acceptance_pct,
+            "rejection_rate_pct": rejection_pct,
+            "revenue": cart["revenue"],
+        })
+        totals["adds"] += cart["adds"]
+        totals["sold"] += cart["sold"]
+        totals["not_sold"] += cart["not_sold"]
+        totals["rejected"] += rejected
+        totals["revenue"] += cart["revenue"]
+
+    total_engaged = totals["adds"] + totals["rejected"]
+    return {
+        "totals": {
+            "cart_adds": totals["adds"],
+            "sold": totals["sold"],
+            "not_sold_cart": totals["not_sold"],
+            "rejected": totals["rejected"],
+            "engaged": total_engaged,
+            "conversion_rate_pct": (
+                round(totals["sold"] / totals["adds"] * 100.0, 2)
+                if totals["adds"] > 0 else 0.0
+            ),
+            "acceptance_rate_pct": (
+                round(totals["adds"] / total_engaged * 100.0, 2)
+                if total_engaged > 0 else 0.0
+            ),
+            "rejection_rate_pct": (
+                round(totals["rejected"] / total_engaged * 100.0, 2)
+                if total_engaged > 0 else 0.0
+            ),
+            "revenue": totals["revenue"],
+        },
+        "by_signal": rows,
+        "by_reason": reasons,
     }

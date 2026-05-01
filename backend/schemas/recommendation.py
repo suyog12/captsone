@@ -38,7 +38,51 @@ class RecommendationsResponse(BaseModel):
     recommendations: list[RecommendationItem]
 
 
-#  Cart helper 
+# Reject
+
+# Allowed reason codes. Keep these in sync with the frontend
+# RejectRecommendationModal quick-pick chips. 'other' opens up a free-text
+# note. New codes can be added without a schema migration since these are
+# stored as varchar in the DB.
+
+REJECTION_REASON_CODES = {
+    "not_relevant",
+    "already_have",
+    "out_of_stock",
+    "price_too_high",
+    "wrong_size_or_spec",
+    "different_brand",
+    "bad_timing",
+    "wrong_recommendation",
+    "other",
+}
+
+
+class RejectRecommendationRequest(BaseModel):
+    """Body for POST /recommendations/reject - seller marks a rec as not useful."""
+
+    cust_id: int = Field(..., description="Customer the rec was for")
+    item_id: int = Field(..., description="Product being rejected")
+    primary_signal: Optional[str] = Field(None, description="Signal that produced the rec")
+    rec_purpose: Optional[str] = Field(None, description="Purpose tag of the rec")
+    reason_code: str = Field(..., description="Quick-pick code, e.g. 'not_relevant'")
+    reason_note: Optional[str] = Field(
+        None, max_length=2000, description="Optional free-text note"
+    )
+
+
+class RejectRecommendationResponse(BaseModel):
+    """Returned on successful rejection."""
+
+    event_id: int
+    cust_id: int
+    item_id: int
+    outcome: Literal["rejected"]
+    reason_code: str
+    rejected_at: datetime
+
+
+# Cart helper
 
 class CartHelperRequest(BaseModel):
     """Request body for POST /recommendations/cart-helper.
@@ -139,7 +183,7 @@ class CartHelperResponse(BaseModel):
     medline_conversions: list[MedlineConversion]
 
 
-#  Purchase history 
+# Purchase history
 
 class PurchaseLine(BaseModel):
     """One line from recdash.purchase_history (with product description joined in)."""

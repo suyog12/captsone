@@ -9,7 +9,7 @@ from backend.models import Customer
 
 
 DEFAULT_SEARCH_LIMIT = 25
-MAX_SEARCH_LIMIT = 100
+MAX_SEARCH_LIMIT = 500
 
 
 async def get_by_id(db: AsyncSession, cust_id: int) -> Optional[Customer]:

@@ -12,11 +12,13 @@ from backend.models import Customer, User
 from backend.schemas.stats import (
     ConversionBySignalResponse,
     CustomerStatsResponse,
+    EngineEffectivenessResponse,
     OverviewResponse,
     RecentSalesResponse,
     SalesTrendResponse,
     SegmentDistributionResponse,
     SellerStatsResponse,
+    TopCustomersResponse,
     TopSellersResponse,
 )
 from backend.services import stats_service
@@ -186,8 +188,7 @@ async def customer_stats(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CustomerStatsResponse:
-    # Authorization: admin or assigned seller (customers cannot pull their own
-    # stats via this endpoint - they don't need it for the dashboard)
+    # Authorization: admin (any), seller (only assigned), customer (only self)
     if user.role == "admin":
         pass
     elif user.role == "seller":
@@ -202,10 +203,16 @@ async def customer_stats(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="This customer is not assigned to you.",
             )
+    elif user.role == "customer":
+        if int(user.cust_id or 0) != cust_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Customers can only view their own stats.",
+            )
     else:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin or seller role required.",
+            detail="Authentication required.",
         )
 
     try:
@@ -275,3 +282,37 @@ async def my_seller_conversion_by_signal(
         db, seller_id=seller.user_id
     )
     return ConversionBySignalResponse(**data)
+
+
+# /admin/stats/top-customers
+
+@router.get(
+    "/admin/stats/top-customers",
+    response_model=TopCustomersResponse,
+    summary="Highest-revenue customers ranked by total spend.",
+)
+async def admin_top_customers(
+    limit: int = Query(10, ge=1, le=50),
+    range: Literal["7d", "30d", "90d", "180d", "1y", "all"] = Query("all"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TopCustomersResponse:
+    _require_admin(user)
+    data = await stats_service.get_top_customers(db, limit=limit, range_str=range)
+    return TopCustomersResponse(**data)
+
+# /admin/stats/engine-effectiveness
+
+
+@router.get(
+    "/admin/stats/engine-effectiveness",
+    response_model=EngineEffectivenessResponse,
+    summary="Recommendation engine funnel: adds, sold, rejected per signal.",
+)
+async def admin_engine_effectiveness(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> EngineEffectivenessResponse:
+    _require_admin(user)
+    data = await stats_service.get_engine_effectiveness(db)
+    return EngineEffectivenessResponse(**data)

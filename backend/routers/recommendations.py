@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.dependencies import get_current_user
 from backend.db.database import get_db
-from backend.models import Customer, User
+from backend.models import Customer, RecommendationEvent, User
 from backend.schemas.recommendation import (
     CartHelperRequest,
     CartHelperResponse,
     RecommendationsResponse,
+    REJECTION_REASON_CODES,
+    RejectRecommendationRequest,
+    RejectRecommendationResponse,
 )
 from backend.services import recommendation_service
 
@@ -100,6 +106,108 @@ async def customer_recommendations(
         n_results=len(items),
         recommendations=items,
     )
+
+
+# Reject
+
+# /recommendations/reject  -  seller marks a rec as not useful, with a reason.
+# Writes a row to recommendation_events with outcome='rejected'. The reason
+# code lets us aggregate failure modes by category later (e.g. "engine
+# over-recommends already-owned items in pediatrics"). Free-text note is
+# optional and capped at 2000 chars by the schema.
+@router.post(
+    "/reject",
+    response_model=RejectRecommendationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Seller rejects a recommendation with a reason (logs feedback for later analysis)",
+)
+async def reject_recommendation(
+    body: RejectRecommendationRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RejectRecommendationResponse:
+    # Sellers only - this is a seller workflow tool
+    if user.role != "seller":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only sellers can reject recommendations.",
+        )
+
+    # Verify the customer is assigned to this seller
+    customer = await db.get(Customer, body.cust_id)
+    if customer is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Customer {body.cust_id} not found.",
+        )
+    if customer.assigned_seller_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This customer is not assigned to you.",
+        )
+
+    # Normalize and validate the reason_code
+    reason_code = (body.reason_code or "").strip().lower()
+    if reason_code not in REJECTION_REASON_CODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown reason_code {reason_code!r}. Allowed: "
+                f"{sorted(REJECTION_REASON_CODES)}"
+            ),
+        )
+
+    # Try to find an existing pending rec event (created when the rec was
+    # surfaced) and update it. If none exists, insert a fresh row - this
+    # keeps the endpoint useful even before the surface-side logging is wired.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    existing = await db.execute(
+        select(RecommendationEvent)
+        .where(RecommendationEvent.cust_id == body.cust_id)
+        .where(RecommendationEvent.item_id == body.item_id)
+        .where(RecommendationEvent.outcome == "pending")
+        .order_by(RecommendationEvent.shown_at.desc())
+        .limit(1)
+    )
+    event = existing.scalar_one_or_none()
+    if event is not None:
+        event.outcome = "rejected"
+        event.resolved_at = now
+        event.rejected_by_user_id = user.user_id
+        event.rejection_reason_code = reason_code
+        event.rejection_reason_note = body.reason_note
+        if body.primary_signal and not event.signal:
+            event.signal = body.primary_signal
+        if body.rec_purpose and not event.rec_purpose:
+            event.rec_purpose = body.rec_purpose
+    else:
+        event = RecommendationEvent(
+            cust_id=body.cust_id,
+            item_id=body.item_id,
+            signal=body.primary_signal,
+            rec_purpose=body.rec_purpose,
+            shown_to_user_id=user.user_id,
+            shown_at=now,
+            outcome="rejected",
+            resolved_at=now,
+            rejected_by_user_id=user.user_id,
+            rejection_reason_code=reason_code,
+            rejection_reason_note=body.reason_note,
+        )
+        db.add(event)
+
+    await db.commit()
+    await db.refresh(event)
+
+    return RejectRecommendationResponse(
+        event_id=event.event_id,
+        cust_id=event.cust_id,
+        item_id=event.item_id,
+        outcome="rejected",
+        reason_code=reason_code,
+        rejected_at=event.resolved_at or now,
+    )
+
 
 # /recommendations/cart-helper
 @router.post(
