@@ -342,3 +342,22 @@ class EngineEffectivenessResponse(BaseModel):
     totals: EngineEffectivenessTotals
     by_signal: list[EngineSignalFunnelRow]
     by_reason: list[EngineRejectionReasonRow]
+
+
+# /admin/stats/churn-funnel
+
+class ChurnFunnelStage(BaseModel):
+    """One stage in the lifecycle funnel."""
+    status: str  # canonical key, e.g. 'churned_warm'
+    label: str   # display label, e.g. 'Churned'
+    count: int
+    pct: float
+    color: str   # color hint for the frontend (blue|green|orange|red)
+
+
+class ChurnFunnelResponse(BaseModel):
+    """Customer lifecycle distribution returned by /admin/stats/churn-funnel."""
+    total: int
+    stages: list[ChurnFunnelStage]
+    other_count: int = 0  # customers with NULL/unknown status
+

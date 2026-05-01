@@ -4,6 +4,7 @@ import { Building2, Users, ShoppingBag, Package, TrendingUp, Calendar, ChevronDo
 import AppShell from '../../components/shell/AppShell.jsx';
 import TopCustomersPanel from '../../components/admin/TopCustomersPanel.jsx';
 import EngineEffectivenessPanel from '../../components/admin/EngineEffectivenessPanel.jsx';
+import ChurnFunnelCard from '../../components/admin/ChurnFunnelCard.jsx';
 import Card, { CardHeader } from '../../components/ui/Card.jsx';
 import StatCard from '../../components/ui/StatCard.jsx';
 import SegmentedControl from '../../components/ui/SegmentedControl.jsx';
@@ -48,6 +49,9 @@ export default function AdminOverview() {
     <AppShell title="Platform overview" subtitle="Population, products, sales activity, engine performance">
       <div className="space-y-6">
         <KpiStrip data={overview.data} loading={overview.isLoading} />
+
+        {/* Customer lifecycle funnel - cold start / stable / declining / churned */}
+        <ChurnFunnelCard />
 
         {/* Engine effectiveness - the recommendation engine ROI story */}
         <EngineEffectivenessPanel />

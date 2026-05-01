@@ -1232,3 +1232,85 @@ async def get_engine_effectiveness(db: AsyncSession) -> dict:
         "by_signal": rows,
         "by_reason": reasons,
     }
+
+"""
+Replacement for get_churn_funnel() in backend/services/stats_service.py.
+
+Now appends an 'other' stage when there are customers whose status is
+not one of the four canonical lifecycle values (NULL, typos, legacy
+codes). This makes the percentages on the dashboard always sum to
+100%.
+
+To apply: see apply-churn-funnel-other-fix.ps1 in Downloads.
+"""
+
+# This is the function that should REPLACE the existing get_churn_funnel()
+# block previously appended to stats_service.py.
+
+_LIFECYCLE_ORDER = [
+    ("cold_start",     "Cold Start", "blue"),
+    ("stable_warm",    "Stable",     "green"),
+    ("declining_warm", "Declining",  "orange"),
+    ("churned_warm",   "Churned",    "red"),
+]
+
+
+async def get_churn_funnel(db: AsyncSession) -> dict:
+    """Return lifecycle distribution across all customers.
+
+    Counts every customer in the customers table (no login filter).
+    Customers with status outside the four canonical values are
+    bucketed into a fifth 'other' stage so percentages always
+    reconcile to 100%.
+
+    Returns shape:
+      {
+        "total": <int>,
+        "stages": [
+          {"status": "cold_start",     "label": "Cold Start", "count": N, "pct": 1.2, "color": "blue"},
+          {"status": "stable_warm",    "label": "Stable",     "count": N, "pct": 60.5, "color": "green"},
+          {"status": "declining_warm", "label": "Declining",  "count": N, "pct": 22.4, "color": "orange"},
+          {"status": "churned_warm",   "label": "Churned",    "count": N, "pct": 12.6, "color": "red"},
+          {"status": "other",          "label": "Other",      "count": N, "pct": 2.1,  "color": "gray"},   # only if > 0
+        ],
+        "other_count": <int>
+      }
+    """
+    result = await db.execute(
+        select(Customer.status, func.count(Customer.cust_id))
+        .group_by(Customer.status)
+    )
+    raw = {(row[0] or "unknown"): int(row[1]) for row in result.all()}
+
+    grand_total = sum(raw.values())
+    known_total = sum(raw.get(s, 0) for s, _, _ in _LIFECYCLE_ORDER)
+    other_count = grand_total - known_total
+
+    stages = []
+    for status, label, color in _LIFECYCLE_ORDER:
+        count = raw.get(status, 0)
+        pct = (count / grand_total * 100.0) if grand_total > 0 else 0.0
+        stages.append({
+            "status": status,
+            "label": label,
+            "count": count,
+            "pct": round(pct, 2),
+            "color": color,
+        })
+
+    # Append the Other / Unknown stage only if there are any
+    if other_count > 0:
+        pct = (other_count / grand_total * 100.0) if grand_total > 0 else 0.0
+        stages.append({
+            "status": "other",
+            "label": "Other",
+            "count": other_count,
+            "pct": round(pct, 2),
+            "color": "gray",
+        })
+
+    return {
+        "total": grand_total,
+        "stages": stages,
+        "other_count": other_count,
+    }

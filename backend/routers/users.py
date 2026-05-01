@@ -257,20 +257,6 @@ async def reactivate_user(
     return UserResponse.model_validate(result)
 
 
-# === BEGIN APPENDED 20260501-043628 ===
-"""
-Append this section to the END of backend/routers/users.py.
-
-The required imports already exist in that file (typing.Optional,
-fastapi HTTPException + status, AsyncSession, get_db,
-require_seller_or_admin, User, user_service, UserResponse,
-pydantic BaseModel + Field). Just append the code below.
-"""
-
-# Append below this line into routers/users.py
-# ============================================================================
-
-
 from pydantic import BaseModel, Field
 
 from backend.models import Customer
@@ -350,4 +336,3 @@ async def attach_login_to_customer(
 
     return UserResponse.model_validate(new_user)
 
-# === END APPENDED 20260501-043628 ===

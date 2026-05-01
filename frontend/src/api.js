@@ -332,3 +332,9 @@ export async function changeMyPassword(currentPassword, newPassword) {
   });
   return data;
 }
+
+// Admin: customer lifecycle distribution (churn funnel)
+export async function getChurnFunnel() {
+  const { data } = await api.get('/admin/stats/churn-funnel');
+  return data;
+}

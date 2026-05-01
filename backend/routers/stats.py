@@ -316,3 +316,23 @@ async def admin_engine_effectiveness(
     _require_admin(user)
     data = await stats_service.get_engine_effectiveness(db)
     return EngineEffectivenessResponse(**data)
+
+
+from backend.schemas.stats import ChurnFunnelResponse
+
+
+# /admin/stats/churn-funnel
+
+@router.get(
+    "/admin/stats/churn-funnel",
+    response_model=ChurnFunnelResponse,
+    summary="Customer lifecycle distribution: counts and percentages by status.",
+)
+async def admin_churn_funnel(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ChurnFunnelResponse:
+    _require_admin(user)
+    data = await stats_service.get_churn_funnel(db)
+    return ChurnFunnelResponse(**data)
+
