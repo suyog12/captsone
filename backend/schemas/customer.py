@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+
+# Single customer record - returned by GET /customers/{cust_id} and /customers/me
 
 class CustomerResponse(BaseModel):
     """Full customer record returned by GET /customers/{cust_id} and /customers/me."""
@@ -28,6 +30,8 @@ class CustomerResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# Customer search/filter result - returned by /customers/search and /customers/filter
+
 class CustomerSearchResult(BaseModel):
     """A single hit in a customer search response."""
 
@@ -40,7 +44,28 @@ class CustomerSearchResult(BaseModel):
     archetype: Optional[str] = None
     assigned_seller_id: Optional[int] = None
 
+    # True when there is a dashboard login (User row) tied to this cust_id.
+    # Populated by the router after the DB read. Defaults to False so the
+    # field is always present in the JSON response.
+    has_user_account: bool = False
+
     model_config = {"from_attributes": True}
+
+
+class CustomerListResponse(BaseModel):
+    """
+    Paginated customer list. Returned by /customers/filter so the
+    frontend can render real pagination ('Page 3 of 47') without
+    fetching every customer.
+
+    'total' is the total number of customers matching the filter set
+    across all pages. 'limit' and 'offset' echo the request parameters.
+    """
+
+    total: int = Field(..., description="Total customers matching the filters across all pages")
+    limit: int = Field(..., description="Page size used for this response")
+    offset: int = Field(..., description="Offset used for this response (0-based)")
+    items: List[CustomerSearchResult] = Field(..., description="The customers on this page")
 
 
 # Customer record creation - no login
@@ -54,29 +79,21 @@ class CustomerRecordCreateRequest(BaseModel):
 
     customer_business_name: str = Field(
         ..., min_length=2, max_length=200,
-        description="Business / account name shown in the customer roster.",
+        description="Display name for the customer (clinic, hospital, practice, etc.)"
     )
     market_code: str = Field(
-        ..., max_length=20,
-        description="Market vertical code (PO, AC, IDN, LTC, HC, LC, SC, ...).",
+        ..., min_length=2, max_length=10,
+        description="Market code: PO, SC, LTC, AC, HC, LC, OTHER"
     )
     size_tier: str = Field(
-        ..., max_length=20,
-        description="Account size tier (new, small, mid, large, enterprise).",
+        ..., min_length=2, max_length=20,
+        description="Size tier: new, small, mid, large, enterprise"
     )
     specialty_code: Optional[str] = Field(
-        None, max_length=20,
-        description=(
-            "Provider specialty code (FP, IM, PD, ...). Optional; defaults "
-            "to None for accounts without a single dominant specialty."
-        ),
+        None, max_length=10,
+        description="Optional specialty code (FP, IM, GS, etc.)"
     )
-    # Admin-only field: leave None when seller is creating
     assigned_seller_id: Optional[int] = Field(
         None,
-        description=(
-            "Admins can pin the new customer to a specific seller. "
-            "Sellers MUST leave this null - it auto-resolves to their own "
-            "user_id. Sellers passing a non-null value get a 403."
-        ),
+        description="Admin only - explicit seller assignment. Sellers must omit this; they are auto-assigned to themselves."
     )

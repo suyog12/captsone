@@ -1,26 +1,3 @@
-"""
-Customer endpoints.
-
-  GET  /customers/search?q=...&limit=...   - search customers (admin/seller)
-  GET  /customers/filter?...&scope=...     - filter customers (admin/seller)
-  POST /customers/record                   - create customer record only (no login)
-  GET  /customers/me                       - current customer's own record
-  GET  /customers/{cust_id}                - one customer's full details
-
-Access control:
-
-  search   : admin sees everyone; seller sees only their assigned customers
-  filter   : admin sees everyone; seller sees their assigned customers by
-             default. Seller may pass scope=all to see the whole customer
-             base (read-only browsing for the platform-wide customer tab).
-  record   : admin or seller. Seller auto-assigns to themselves; admin can
-             pass an explicit assigned_seller_id (or leave null).
-  me       : customer role only; returns the customer linked to their user
-  {cust_id}: admin sees anyone; seller can READ any customer (response
-             includes is_assigned_to_me so the UI can gate cart actions);
-             customer sees only self
-"""
-
 from __future__ import annotations
 
 from typing import Optional
@@ -35,60 +12,104 @@ from backend.core.dependencies import (
 from backend.db.database import get_db
 from backend.models import User
 from backend.schemas.customer import (
+    CustomerListResponse,
     CustomerRecordCreateRequest,
     CustomerResponse,
     CustomerSearchResult,
 )
-from backend.services import customer_service, user_service
+from backend.services import (
+    assignment_service,
+    customer_service,
+    user_service,
+)
 
 
-router = APIRouter(prefix="/customers", tags=["customers"])
+router = APIRouter(tags=["customers"])
 
+
+# ---------------------------------------------------------------------------
+# GET /customers/search
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/search",
+    "/customers/search",
     response_model=list[CustomerSearchResult],
-    summary="Search customers by id, market, specialty, or segment",
+    summary="Search customers by id, market, specialty, segment, or business name",
 )
 async def search_customers(
     q: str = Query(..., min_length=1, max_length=50, description="Search text"),
-    limit: int = Query(25, ge=1, le=500),
+    limit: int = Query(25, ge=1),
+    scope: str = Query("mine", description="'mine' = seller's assigned customers (default for sellers); 'all' = entire customer base"),
     user: User = Depends(require_seller_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[CustomerSearchResult]:
     """
     Search customers.
 
-    For admin: searches the entire customer base.
-    For seller: searches only customers assigned to this seller.
+    Scope semantics:
+      - admin: scope is ignored, admin always searches the full base.
+      - seller, scope='mine' (default): only customers assigned to this seller.
+      - seller, scope='all': search the entire customer base
+        (read-only browse; mirrors /customers/filter?scope=all).
 
     Search modes:
       - Numeric input -> exact cust_id match
       - 1 to 6 letters uppercase -> market_code or specialty_code exact match
-      - Longer text -> ILIKE substring match against segment
+      - Longer text -> ILIKE substring match against segment OR customer_name
+        (so newly-created records with a populated business name are also
+        searchable by name)
     """
-    seller_id = user.user_id if user.role == "seller" else None
-    rows = await customer_service.search(db, q, limit=limit, seller_id=seller_id)
-    return [CustomerSearchResult.model_validate(r) for r in rows]
+    if scope not in ("mine", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail="scope must be 'mine' or 'all'.",
+        )
 
+    if user.role == "admin":
+        effective_seller_id: Optional[int] = None
+    elif user.role == "seller":
+        effective_seller_id = user.user_id if scope == "mine" else None
+    else:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    rows = await customer_service.search(
+        db, query=q, limit=limit, seller_id=effective_seller_id,
+    )
+
+    # Hydrate has_user_account in one round-trip for the whole page
+    cust_ids = [r.cust_id for r in rows]
+    user_map = await customer_service.get_user_account_map(db, cust_ids)
+
+    out = []
+    for r in rows:
+        item = CustomerSearchResult.model_validate(r)
+        item.has_user_account = bool(user_map.get(r.cust_id, False))
+        out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GET /customers/filter
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/filter",
-    response_model=list[CustomerSearchResult],
-    summary="Filter customers by segment, status, archetype, market, or specialty",
+    "/customers/filter",
+    response_model=CustomerListResponse,
+    summary="Filter customers by segment, status, archetype, market, specialty, or account status",
 )
 async def filter_customers(
     segment:        Optional[str] = Query(None, description="e.g. 'PO_large'"),
-    status:         Optional[str] = Query(None, description="cold_start | stable_warm | declining_warm | churned_warm"),
+    status_filter:  Optional[str] = Query(None, alias="status", description="cold_start | stable_warm | declining_warm | churned_warm"),
     archetype:      Optional[str] = Query(None, description="e.g. 'surgery_center', 'primary_care'"),
     market_code:    Optional[str] = Query(None, description="e.g. 'PO', 'SC', 'LTC'"),
     specialty_code: Optional[str] = Query(None, description="e.g. 'FP', 'GS'"),
+    account_status: Optional[str] = Query(None, description="all | users | no_users"),
     scope:          str = Query("mine", description="'mine' = only assigned (default for sellers); 'all' = entire customer base"),
-    limit:          int = Query(25, ge=1, le=500),
+    limit:          int = Query(25, ge=1),
     offset:         int = Query(0, ge=0),
     user: User = Depends(require_seller_or_admin),
     db: AsyncSession = Depends(get_db),
-) -> list[CustomerSearchResult]:
+) -> CustomerListResponse:
     """
     Filtered customer browsing for the dashboard.
 
@@ -99,26 +120,41 @@ async def filter_customers(
       - seller, scope='mine' (default): only customers assigned to this seller
       - seller, scope='all': every customer in the system (read-only browse)
 
+    Account status semantics:
+      - omitted or 'all': do not filter by account status
+      - 'users':   only customers WITH a dashboard login
+      - 'no_users': only customers WITHOUT a dashboard login
+
     Common queries:
       GET /customers/filter?status=churned_warm
       GET /customers/filter?archetype=surgery_center&segment=SC_large
+      GET /customers/filter?account_status=no_users   (onboarding queue)
       GET /customers/filter?scope=all&status=stable_warm   (seller browse mode)
+
+    Response shape: { total, limit, offset, items: [...] }. The 'total'
+    field is the count across all pages (used for 'Page 3 of 47' UI).
     """
-    # Validate scope value.
-    # NOTE: the local "status" query parameter shadows the imported
-    # fastapi.status module here, so use the integer literal 400.
+    # Validate scope value (use 400 literal because 'status_filter' alias
+    # avoids shadowing fastapi.status; 400 is also explicit)
     if scope not in ("mine", "all"):
         raise HTTPException(
             status_code=400,
             detail="scope must be 'mine' or 'all'.",
         )
 
+    # Validate account_status value
+    if account_status is not None and account_status not in ("all", "users", "no_users"):
+        raise HTTPException(
+            status_code=400,
+            detail="account_status must be 'all', 'users', or 'no_users'.",
+        )
+    if account_status == "all":
+        account_status = None  # Treat 'all' as no filter
+
     # Resolve effective seller filter
     if user.role == "admin":
-        # Admin always sees everyone, scope is ignored
         effective_seller_id: Optional[int] = None
     elif user.role == "seller":
-        # Seller toggles between their book and the full base
         effective_seller_id = user.user_id if scope == "mine" else None
     else:
         # require_seller_or_admin guarantees this branch is unreachable
@@ -127,116 +163,133 @@ async def filter_customers(
     rows = await customer_service.search_by_filters(
         db,
         segment=segment,
-        status=status,
+        status=status_filter,
         archetype=archetype,
         market_code=market_code,
         specialty_code=specialty_code,
         seller_id=effective_seller_id,
+        account_status=account_status,
         limit=limit,
         offset=offset,
     )
-    return [CustomerSearchResult.model_validate(r) for r in rows]
+
+    total = await customer_service.count_by_filters(
+        db,
+        segment=segment,
+        status=status_filter,
+        archetype=archetype,
+        market_code=market_code,
+        specialty_code=specialty_code,
+        seller_id=effective_seller_id,
+        account_status=account_status,
+    )
+
+    # Hydrate has_user_account
+    cust_ids = [r.cust_id for r in rows]
+    user_map = await customer_service.get_user_account_map(db, cust_ids)
+
+    items: list[CustomerSearchResult] = []
+    for r in rows:
+        item = CustomerSearchResult.model_validate(r)
+        item.has_user_account = bool(user_map.get(r.cust_id, False))
+        items.append(item)
+
+    return CustomerListResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=items,
+    )
 
 
-# Create customer record only - no login
+# ---------------------------------------------------------------------------
+# POST /customers/record - create customer record only, no login
+# ---------------------------------------------------------------------------
+
 @router.post(
-    "/record",
+    "/customers/record",
     response_model=CustomerResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create a customer record (no login). Sellers auto-assign to themselves.",
+    summary="Create a customer record (no login). Sellers auto-assign; admins may set assigned_seller_id.",
 )
 async def create_customer_record(
     body: CustomerRecordCreateRequest,
     user: User = Depends(require_seller_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> CustomerResponse:
-    """
-    Creates a Customer row in recdash.customers without a User login.
-    Useful for sellers adding new accounts they're already in contact
-    with - they don't need to invent a password and the customer can be
-    issued a login later by an admin.
-
-    Auto-assignment rules:
-      - Seller calling this endpoint: assigned_seller_id is forced to
-        user.user_id. Any non-null value in the body is rejected with 403.
-      - Admin: respects body.assigned_seller_id (may be None for an
-        unassigned customer).
-    """
-    if user.role == "seller":
-        if (
-            body.assigned_seller_id is not None
-            and body.assigned_seller_id != user.user_id
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=(
-                    "Sellers cannot assign customers to another seller. "
-                    "Leave assigned_seller_id blank - it will be set to "
-                    "your user_id automatically."
-                ),
-            )
-        assigned_seller_id = user.user_id
-    else:
-        # admin
-        assigned_seller_id = body.assigned_seller_id
-
-    try:
-        customer = await user_service.create_customer_record_only(
-            db,
-            customer_business_name=body.customer_business_name,
-            market_code=body.market_code,
-            size_tier=body.size_tier,
-            specialty_code=body.specialty_code,
-            assigned_seller_id=assigned_seller_id,
-            actor_user_id=user.user_id,
-        )
-    except ValueError as e:
+    # Sellers cannot pin a record to another seller
+    if user.role == "seller" and body.assigned_seller_id is not None and body.assigned_seller_id != user.user_id:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(e)
+            status_code=403,
+            detail="Sellers cannot assign customers to another seller. Omit assigned_seller_id to auto-assign.",
         )
 
-    resp = CustomerResponse.model_validate(customer)
-    resp.is_assigned_to_me = (
-        assigned_seller_id is not None and assigned_seller_id == user.user_id
-    )
-    return resp
+    # Compute effective assignment
+    if user.role == "seller":
+        effective_assignee = user.user_id  # Sellers always self-assign
+    else:
+        effective_assignee = body.assigned_seller_id  # Admins may pass null
 
+    customer = await user_service.create_customer_record_only(
+        db,
+        customer_business_name=body.customer_business_name,
+        market_code=body.market_code,
+        size_tier=body.size_tier,
+        specialty_code=body.specialty_code,
+        assigned_seller_id=effective_assignee,
+        actor_user_id=user.user_id,
+    )
+
+    response = CustomerResponse.model_validate(customer)
+    if user.role == "seller":
+        response.is_assigned_to_me = (customer.assigned_seller_id == user.user_id)
+    else:
+        response.is_assigned_to_me = True
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /customers/me - the logged-in customer's own record
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/me",
+    "/customers/me",
     response_model=CustomerResponse,
-    summary="Customer's own record",
+    summary="Get the logged-in customer's own record",
 )
 async def get_my_customer_record(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CustomerResponse:
-    """
-    Return the customer record linked to the current user.
-
-    Only available to users with role='customer' and a populated cust_id.
-    """
     if user.role != "customer":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint is for customer users only.",
+            status_code=403,
+            detail="/me endpoints are for customers only.",
         )
     if user.cust_id is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No customer record is linked to this user.",
+            status_code=404,
+            detail="This account is not linked to a customer record.",
         )
+
     customer = await customer_service.get_by_id(db, user.cust_id)
     if customer is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Linked customer record not found.",
+            status_code=404,
+            detail=f"Customer {user.cust_id} not found.",
         )
-    return CustomerResponse.model_validate(customer)
 
+    response = CustomerResponse.model_validate(customer)
+    response.is_assigned_to_me = None  # Not meaningful for self-view
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /customers/{cust_id}
+# ---------------------------------------------------------------------------
 
 @router.get(
-    "/{cust_id}",
+    "/customers/{cust_id}",
     response_model=CustomerResponse,
     summary="Get one customer by cust_id",
 )
@@ -271,14 +324,12 @@ async def get_customer(
 
     response = CustomerResponse.model_validate(customer)
 
-    # For sellers, annotate whether this customer belongs to them so the
-    # frontend can show the right action set without an extra round-trip
+    # is_assigned_to_me flag
     if user.role == "seller":
         response.is_assigned_to_me = (
             customer.assigned_seller_id == user.user_id
         )
     elif user.role == "admin":
-        # Admins see all customers as their own for action purposes
         response.is_assigned_to_me = True
     else:
         response.is_assigned_to_me = True

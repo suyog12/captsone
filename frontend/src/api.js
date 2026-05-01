@@ -106,9 +106,16 @@ export async function reactivateUser(userId) {
 }
 
 // Customers
-
-export async function searchCustomers(q, limit = 25) {
-  const { data } = await api.get('/customers/search', { params: { q, limit } });
+//
+// searchCustomers accepts an optional `scope` parameter:
+//   undefined or 'mine' (default) - sellers see only their assigned customers
+//   'all'                          - sellers can search the whole base (used by
+//                                    the seller's "All customers" tab)
+// Admins ignore scope; they always search the full base.
+export async function searchCustomers(q, limit = 25, scope = undefined) {
+  const params = { q, limit };
+  if (scope) params.scope = scope;
+  const { data } = await api.get('/customers/search', { params });
   return data;
 }
 
@@ -275,7 +282,6 @@ export async function getRecentSales(params = {}) {
   return data;
 }
 
-
 // Products - catalog browse
 export async function browseProducts(params = {}) {
   const { data } = await api.get('/products', { params });
@@ -286,7 +292,6 @@ export async function getProductFilters() {
   const { data } = await api.get('/products/filters');
   return data;
 }
-// Append to src/api.js
 
 // Admin: top customers by revenue
 export async function getTopCustomers(params = {}) {
@@ -294,11 +299,6 @@ export async function getTopCustomers(params = {}) {
   const { data } = await api.get('/admin/stats/top-customers', { params });
   return data;
 }
-
-
-
-// === appended via apply script ===
-// Append to the bottom of src/api.js
 
 // Recommendations - reject (seller-only)
 export async function rejectRecommendation(payload) {
@@ -332,4 +332,3 @@ export async function changeMyPassword(currentPassword, newPassword) {
   });
   return data;
 }
-

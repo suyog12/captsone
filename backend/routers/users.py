@@ -255,3 +255,99 @@ async def reactivate_user(
             detail=f"User {user_id} not found.",
         )
     return UserResponse.model_validate(result)
+
+
+# === BEGIN APPENDED 20260501-043628 ===
+"""
+Append this section to the END of backend/routers/users.py.
+
+The required imports already exist in that file (typing.Optional,
+fastapi HTTPException + status, AsyncSession, get_db,
+require_seller_or_admin, User, user_service, UserResponse,
+pydantic BaseModel + Field). Just append the code below.
+"""
+
+# Append below this line into routers/users.py
+# ============================================================================
+
+
+from pydantic import BaseModel, Field
+
+from backend.models import Customer
+
+
+class AttachLoginRequest(BaseModel):
+    """Body for POST /users/customers/{cust_id}/login.
+
+    Used to give an existing customer (who has a record but no login)
+    the ability to sign into the dashboard. Both admins and sellers
+    can call this endpoint, but a seller may only attach a login to
+    customers assigned to them.
+    """
+    username: str = Field(min_length=3, max_length=100)
+    password: str = Field(min_length=6, max_length=200)
+    full_name: Optional[str] = Field(None, max_length=200)
+    email: Optional[str] = Field(None, max_length=200)
+
+
+@router.post(
+    "/customers/{cust_id}/login",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Attach a dashboard login to an existing customer record",
+)
+async def attach_login_to_customer(
+    cust_id: int,
+    body: AttachLoginRequest,
+    user: User = Depends(require_seller_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """
+    Create a User row tied to an existing Customer row.
+
+    Authorization:
+      admin  - may attach a login to any customer.
+      seller - may only attach a login to customers assigned to them.
+
+    Returns 404 if the customer does not exist, 403 if the seller does
+    not own this customer, 409 if the customer already has a login or
+    the username is already taken.
+    """
+    # Confirm the customer exists and resolve assignment
+    customer = await db.get(Customer, cust_id)
+    if customer is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Customer {cust_id} not found.",
+        )
+
+    # Sellers can only attach a login to their own assigned customers.
+    # Without this check, a seller could give themselves a backdoor by
+    # creating a login for a colleague's customer. Admins are unrestricted.
+    if user.role == "seller":
+        if customer.assigned_seller_id != user.user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only add a login to customers assigned to you.",
+            )
+
+    try:
+        new_user = await user_service.attach_login_to_customer(
+            db,
+            cust_id=cust_id,
+            username=body.username,
+            password=body.password,
+            full_name=body.full_name,
+            email=body.email,
+        )
+    except ValueError as e:
+        msg = str(e)
+        # "Customer not found" should not happen here (we just checked)
+        # but map it cleanly anyway. Username/account collisions are 409.
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
+
+    return UserResponse.model_validate(new_user)
+
+# === END APPENDED 20260501-043628 ===

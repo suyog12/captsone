@@ -309,3 +309,65 @@ async def create_customer_record_only(
     await db.commit()
     await db.refresh(customer)
     return customer
+
+
+# === BEGIN APPENDED 20260501-043628 ===
+"""
+Append this function to the END of backend/services/user_service.py.
+
+It reuses _create_user() and the Customer/User imports already present
+in that file. Don't duplicate any imports.
+
+Used by the new POST /users/customers/{cust_id}/login endpoint.
+"""
+
+# Append below this line into user_service.py
+# ============================================================================
+
+
+async def attach_login_to_customer(
+    db: AsyncSession,
+    *,
+    cust_id: int,
+    username: str,
+    password: str,
+    full_name: Optional[str] = None,
+    email: Optional[str] = None,
+) -> User:
+    """Attach a dashboard login (User row) to an EXISTING customer record.
+
+    Used by POST /users/customers/{cust_id}/login. Differs from
+    create_customer() in that it does NOT create a new customer record -
+    the customer must already exist and must not already have a login.
+
+    Raises:
+        ValueError("Customer {cust_id} not found.")
+        ValueError("Customer {cust_id} already has a dashboard login.")
+        ValueError("Username {username!r} is already taken.")
+    """
+    # Confirm the customer exists
+    customer = await db.get(Customer, cust_id)
+    if customer is None:
+        raise ValueError(f"Customer {cust_id} not found.")
+
+    # Confirm the customer does not already have a login
+    stmt = select(User).where(User.cust_id == cust_id).limit(1)
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing is not None:
+        raise ValueError(f"Customer {cust_id} already has a dashboard login.")
+
+    # Reuse the standard user creation path. _create_user handles password
+    # hashing and the username-already-taken case.
+    user = await _create_user(
+        db,
+        username=username,
+        password=password,
+        role="customer",
+        full_name=full_name,
+        email=email,
+        cust_id=cust_id,
+        commit=True,
+    )
+    return user
+
+# === END APPENDED 20260501-043628 ===

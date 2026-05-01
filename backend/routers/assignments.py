@@ -17,7 +17,7 @@ from backend.schemas.assignment import (
     SellerCustomerListResponse,
 )
 from backend.schemas.customer import CustomerSearchResult
-from backend.services import assignment_service
+from backend.services import assignment_service, customer_service
 
 
 router = APIRouter(tags=["assignments"])
@@ -211,10 +211,16 @@ async def list_my_customers(
     customers, total = await assignment_service.list_for_seller(
         db, seller_id=user.user_id, limit=limit, offset=offset
     )
-    items = [
-        CustomerSearchResult.model_validate(c).model_dump()
-        for c in customers
-    ]
+
+    # Hydrate has_user_account flag in one round-trip
+    cust_ids = [c.cust_id for c in customers]
+    user_map = await customer_service.get_user_account_map(db, cust_ids)
+    items = []
+    for c in customers:
+        item = CustomerSearchResult.model_validate(c)
+        item.has_user_account = bool(user_map.get(c.cust_id, False))
+        items.append(item.model_dump())
+
     return SellerCustomerListResponse(
         seller_id=user.user_id,
         seller_username=user.username,
@@ -263,10 +269,15 @@ async def list_seller_customers(
         db, seller_id=user_id, limit=limit, offset=offset
     )
 
-    items = [
-        CustomerSearchResult.model_validate(c).model_dump()
-        for c in customers
-    ]
+    # Hydrate has_user_account flag in one round-trip
+    cust_ids = [c.cust_id for c in customers]
+    user_map = await customer_service.get_user_account_map(db, cust_ids)
+    items = []
+    for c in customers:
+        item = CustomerSearchResult.model_validate(c)
+        item.has_user_account = bool(user_map.get(c.cust_id, False))
+        items.append(item.model_dump())
+
     return SellerCustomerListResponse(
         seller_id=user_id,
         seller_username=target.username,
