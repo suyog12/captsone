@@ -201,7 +201,7 @@ export default function AdminProducts() {
                     <th className="text-left px-3 py-2">Product</th>
                     <th className="text-left px-3 py-2">Family</th>
                     <th className="text-right px-3 py-2">Units</th>
-                    <th className="text-right px-3 py-2">Txns</th>
+                    <th className="text-right px-3 py-2">transactions</th>
                     <th className="text-right px-3 py-2">Rec-driven</th>
                     <th className="text-right px-5 py-2">Revenue</th>
                   </tr>

@@ -46,7 +46,7 @@ export default function Sidebar() {
         <div className="pl-2">
           <div className="text-white text-sm font-semibold tracking-widest uppercase">McKesson</div>
           <div className="text-mck-blue-light text-[10px] mt-0.5 tracking-wider uppercase">
-            Recommendation Intelligence
+            MedSurg Recommendations
           </div>
         </div>
       </div>

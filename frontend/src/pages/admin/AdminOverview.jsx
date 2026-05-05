@@ -128,8 +128,8 @@ function KpiStrip({ data, loading }) {
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <MiniStat label="Sales (7d)" value={formatCurrency(last7.revenue)} hint={`${formatNumber(last7.transactions)} txns`} />
-        <MiniStat label="Sales (30d)" value={formatCurrency(last30.revenue)} hint={`${formatNumber(last30.transactions)} txns`} />
+        <MiniStat label="Sales (7d)" value={formatCurrency(last7.revenue)} hint={`${formatNumber(last7.transactions)} transactions`} />
+        <MiniStat label="Sales (30d)" value={formatCurrency(last30.revenue)} hint={`${formatNumber(last30.transactions)} transactions`} />
         <MiniStat
           label="Distinct customers (30d)"
           value={formatNumber(last30.distinct_customers)}

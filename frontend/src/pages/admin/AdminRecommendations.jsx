@@ -43,7 +43,7 @@ export default function AdminRecommendations() {
   }, [rows, sortBy]);
 
   return (
-    <AppShell title="Recommendations" subtitle="Is the engine actually moving sales?">
+    <AppShell title="Recommendations">
       <div className="space-y-6">
         {/* Funnel KPIs */}
         <FunnelStrip data={data} loading={isLoading} />
@@ -121,7 +121,7 @@ function FunnelStrip({ data, loading }) {
       <StatCard
         label="Overall conversion"
         value={formatPercentValue(data.overall_conversion_rate_pct)}
-        hint="Adds that became sales"
+        hint="Recommendations to sales"
         icon={TrendingUp}
         accent="mck-orange"
       />

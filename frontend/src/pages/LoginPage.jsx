@@ -88,12 +88,12 @@ export default function LoginPage() {
         </div>
         <div className="relative z-10">
           <h1 className="text-white text-4xl font-semibold leading-tight">
-            Recommendation
+            Medical-Surgical
             <br />
-            Intelligence Platform
+            Recommendation Prototype
           </h1>
           <p className="text-slate-300 mt-4 text-base max-w-md leading-relaxed">
-            Eight signal types. Specialty-aware ranking. Transparent pitch reasoning behind every recommendation.
+            A recommendation engine prototype helping sales representatives cross-sell through customer and product segmentation.
           </p>
           <div className="mt-10 grid grid-cols-3 gap-4 max-w-md">
             <Stat label="Signal types" value="8" />
@@ -109,7 +109,7 @@ export default function LoginPage() {
         <div className="w-full max-w-md">
           <div className="lg:hidden mb-8 text-center">
             <div className="text-mck-navy text-xl font-semibold tracking-widest uppercase">McKesson</div>
-            <div className="text-mck-blue text-xs mt-1">Recommendation Intelligence</div>
+            <div className="text-mck-blue text-xs mt-1">MedSurg Recommendationss</div>
           </div>
 
           <div className="bg-white rounded-xl shadow-card p-8">
