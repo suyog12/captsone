@@ -148,7 +148,13 @@ function ProductsTable({ rows }) {
   const visible = expanded === 1 ? rows : rows.slice(0, INITIAL);
   return (
     <div className="border-t border-slate-100">
-      <table className="w-full text-sm">
+      <table className="w-full text-sm table-fixed">
+        <colgroup>
+          <col className="w-12" />
+          <col />
+          <col className="w-20" />
+          <col className="w-32" />
+        </colgroup>
         <thead>
           <tr className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
             <th className="text-left px-5 py-2">#</th>
@@ -160,13 +166,20 @@ function ProductsTable({ rows }) {
         <tbody>
           {visible.map((p, i) => (
             <tr key={p.item_id || i} className="border-t border-slate-100 hover:bg-slate-50/50">
-              <td className="px-5 py-2 text-slate-400 text-xs">{i + 1}</td>
-              <td className="px-3 py-2">
-                <div className="text-mck-navy font-medium truncate max-w-[16rem]">{p.description || `Item ${p.item_id}`}</div>
-                <div className="text-[11px] text-slate-500">{p.family || ''}</div>
+              <td className="px-5 py-2 text-slate-400 text-xs align-top">{i + 1}</td>
+              <td className="px-3 py-2 min-w-0">
+                <div
+                  className="text-mck-navy font-medium truncate"
+                  title={p.description || `Item ${p.item_id}`}
+                >
+                  {p.description || `Item ${p.item_id}`}
+                </div>
+                <div className="text-[11px] text-slate-500 truncate" title={p.family || ''}>
+                  {p.family || ''}
+                </div>
               </td>
-              <td className="px-3 py-2 text-right text-slate-600">{formatNumber(p.quantity)}</td>
-              <td className="px-5 py-2 text-right text-mck-navy font-semibold">{formatCurrency(p.revenue)}</td>
+              <td className="px-3 py-2 text-right text-slate-600 align-top">{formatNumber(p.quantity)}</td>
+              <td className="px-5 py-2 text-right text-mck-navy font-semibold align-top">{formatCurrency(p.revenue)}</td>
             </tr>
           ))}
         </tbody>
