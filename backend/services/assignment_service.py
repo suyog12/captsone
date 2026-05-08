@@ -88,11 +88,6 @@ async def assign_or_reassign(
 
     # No-op short-circuit (still writes history with a skip note)
     if previous_seller_id == new_seller_id:
-        # Useful for audit but we do not write history for true no-ops.
-        # Just return a synthetic non-persisted record.
-        # Better to raise so the caller can return 200 with a clear message.
-        # Here we just return None-like by writing a no-op history row.
-        # Choose: skip the history write, let the caller handle.
         raise ValueError(
             "Customer is already in the requested assignment state; no change made."
         )
@@ -124,7 +119,6 @@ async def assign_or_reassign(
 
 
 # Seller self-claim of unassigned customer
-
 async def seller_claim(
     db: AsyncSession,
     *,
@@ -234,7 +228,6 @@ async def bulk_assign(
 
 
 # Auto-unassign on seller deactivation
-
 async def auto_unassign_for_seller_deactivation(
     db: AsyncSession,
     *,

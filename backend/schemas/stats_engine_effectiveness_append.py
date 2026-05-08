@@ -1,9 +1,3 @@
-"""
-Append the contents of this file to the bottom of
-backend/schemas/stats.py - they reference CodeAndDisplay which is
-already defined in that file.
-"""
-
 from decimal import Decimal
 from typing import Optional
 
@@ -11,11 +5,9 @@ from pydantic import BaseModel, Field
 
 
 # /admin/stats/engine-effectiveness
-
-
 class EngineSignalFunnelRow(BaseModel):
     """One signal's funnel: adds, sold, rejected, with derived rates."""
-    signal: "CodeAndDisplay"  # forward reference - exists in stats.py
+    signal: "CodeAndDisplay"
     cart_adds: int = Field(..., description="Cart adds attributed to this signal.")
     sold: int = Field(..., description="Of those adds, how many became sold cart lines.")
     not_sold_cart: int = Field(..., description="Adds that the seller marked not_sold (cart-side decline).")

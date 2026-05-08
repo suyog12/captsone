@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 
 class RecommendationItem(BaseModel):
     """A single recommendation. Same shape for precomputed and cold-start."""
-
     rank: int
     item_id: int
     description: Optional[str] = None
@@ -39,12 +38,6 @@ class RecommendationsResponse(BaseModel):
 
 
 # Reject
-
-# Allowed reason codes. Keep these in sync with the frontend
-# RejectRecommendationModal quick-pick chips. 'other' opens up a free-text
-# note. New codes can be added without a schema migration since these are
-# stored as varchar in the DB.
-
 REJECTION_REASON_CODES = {
     "not_relevant",
     "already_have",
@@ -60,7 +53,6 @@ REJECTION_REASON_CODES = {
 
 class RejectRecommendationRequest(BaseModel):
     """Body for POST /recommendations/reject - seller marks a rec as not useful."""
-
     cust_id: int = Field(..., description="Customer the rec was for")
     item_id: int = Field(..., description="Product being rejected")
     primary_signal: Optional[str] = Field(None, description="Signal that produced the rec")
@@ -73,7 +65,6 @@ class RejectRecommendationRequest(BaseModel):
 
 class RejectRecommendationResponse(BaseModel):
     """Returned on successful rejection."""
-
     event_id: int
     cust_id: int
     item_id: int
@@ -83,7 +74,6 @@ class RejectRecommendationResponse(BaseModel):
 
 
 # Cart helper
-
 class CartHelperRequest(BaseModel):
     """Request body for POST /recommendations/cart-helper.
 
@@ -102,7 +92,6 @@ class CartHelperRequest(BaseModel):
     If cart_items is provided and non-empty, it takes precedence over
     whatever is in Postgres.
     """
-
     cust_id: int = Field(..., description="The customer whose cart this is")
     cart_items: Optional[list[int]] = Field(
         default=None,
@@ -117,7 +106,6 @@ class CartHelperRequest(BaseModel):
 
 class CartComplement(BaseModel):
     """One cart-complement suggestion (from product_cooccurrence)."""
-
     trigger_item_id: int
     trigger_description: Optional[str] = None
     item_id: int
@@ -135,7 +123,6 @@ class CartComplement(BaseModel):
 
 class PrivateBrandUpgrade(BaseModel):
     """One private-brand upgrade suggestion."""
-
     cart_item_id: int
     cart_item_description: Optional[str] = None
     pb_item_id: int
@@ -150,7 +137,6 @@ class PrivateBrandUpgrade(BaseModel):
 
 class MedlineConversion(BaseModel):
     """One Medline-to-McKesson conversion suggestion."""
-
     medline_item_id: int
     medline_description: Optional[str] = None
     mckesson_item_id: int
@@ -165,7 +151,6 @@ class MedlineConversion(BaseModel):
 
 class CartHelperResponse(BaseModel):
     """Response from POST /recommendations/cart-helper."""
-
     cust_id: int
     cart_size: int
     cart_source: Literal["request_body", "postgres_cart", "empty"] = Field(
@@ -184,10 +169,8 @@ class CartHelperResponse(BaseModel):
 
 
 # Purchase history
-
 class PurchaseLine(BaseModel):
     """One line from recdash.purchase_history (with product description joined in)."""
-
     purchase_id: int
     item_id: int
     description: Optional[str] = None
@@ -202,7 +185,6 @@ class PurchaseLine(BaseModel):
 
 class PurchaseHistoryResponse(BaseModel):
     """Response wrapper for GET /customers/{cust_id}/history."""
-
     cust_id: int
     total_lines: int
     returned: int

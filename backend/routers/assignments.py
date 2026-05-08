@@ -24,7 +24,6 @@ router = APIRouter(tags=["assignments"])
 
 
 # Admin: assign / reassign / unassign one customer
-
 @router.patch(
     "/customers/{cust_id}/assignment",
     response_model=AssignmentChangeResponse,
@@ -71,7 +70,6 @@ async def change_assignment(
 
 
 # Seller: claim an unassigned customer
-
 @router.post(
     "/customers/{cust_id}/claim",
     response_model=AssignmentChangeResponse,
@@ -118,7 +116,6 @@ async def claim_customer(
 
 
 # Admin: bulk-assign many customers to one seller
-
 @router.post(
     "/customers/assignments/bulk",
     response_model=BulkAssignResponse,
@@ -159,7 +156,6 @@ async def bulk_assign(
 
 
 # Read: assignment history for one customer
-
 @router.get(
     "/customers/{cust_id}/assignment-history",
     response_model=AssignmentHistoryResponse,
@@ -190,7 +186,6 @@ async def assignment_history(
 
 
 # Read: seller's own customers
-
 @router.get(
     "/sellers/me/customers",
     response_model=SellerCustomerListResponse,
@@ -230,7 +225,6 @@ async def list_my_customers(
 
 
 # Read: list customers for a seller (admin-or-self)
-
 @router.get(
     "/sellers/{user_id}/customers",
     response_model=SellerCustomerListResponse,

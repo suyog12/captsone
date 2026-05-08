@@ -1,24 +1,32 @@
-# Product Recommendation Dashboard
+# McKesson Medical-Surgical Recommendation Engine
 
-A B2B product recommendation system for medical and surgical supply distribution. The project takes raw transaction history, customer metadata, and product metadata, runs an offline analytics pipeline to compute behavioral signals, and serves personalized recommendations through a REST API and an interactive React dashboard. Each recommendation comes with a plain-English pitch reason explaining why that product was chosen for that customer, so a sales rep using the dashboard can have a real conversation about it instead of just throwing items at a wall.
+A B2B product recommendation system for medical and surgical supply distribution. The project takes raw transaction history, customer metadata, and product metadata, runs an offline analytics pipeline to compute behavioral signals, and serves personalized recommendations through a REST API and an interactive React dashboard. Each recommendation comes with a plain-English pitch reason explaining why that product was chosen for that customer, so a sales rep using the dashboard can have a real conversation about it instead of throwing items at a wall.
 
 The recommendations are not generic "people who bought X also bought Y" suggestions. They are evidence-gated, segment-aware, and built on top of explicit behavioral signals (peer adoption gaps, replenishment cycles, lapsed recovery, brand alternatives, item co-occurrence, item similarity, popularity backfill). Brand new customers with no purchase history get a separate cold-start path that returns specialty-aligned popularity recommendations instead of failing.
 
+## Vision
+
+The engine exists to solve one specific business problem: McKesson sales reps process the orders customers ask for, but customers do not ask for products they are not aware of. They do not ask for the McKesson Brand alternative to a competitor's product. They do not ask for the gauze they used to buy regularly and stopped reordering. They do not ask for the rest of the chemistry reagent panel when calling about a single item.
+
+Across 389,000 customer locations and $8.23 billion in annual revenue, even a small lift in cross-sell, replenishment recovery, or brand conversion translates into meaningful business impact. The engine surfaces these missed opportunities with the supporting evidence attached, so the rep can confidently raise the recommendation in the next conversation with the customer.
+
+The long-term vision is for the engine output to become a data product that integrates with whatever workflow McKesson chooses, not just the reference dashboard built here. The dashboard demonstrates capability. The engine output is the long-term asset.
+
 ## What the project does
 
-At a high level, the system answers four questions for any given customer:
+At a high level, the system answers four questions for any customer:
 
 1. What products should this customer be buying that they currently are not? (peer gap)
-2. What products are they running low on or overdue to reorder? (replenishment)
+2. What products are they overdue to reorder? (replenishment)
 3. What products did they used to buy that they have stopped? (lapsed recovery)
 4. What products would pair well with what they already buy? (cart complement and item similarity)
 
 It also flags two brand-strategy opportunities:
 
-5. Where could a private-brand alternative replace a national-brand item already in their cart? (private brand upgrade)
-6. Where could a competitor's brand be converted to ours?
+5. Where could a McKesson Brand alternative replace a national-brand item already in the cart? (private brand upgrade)
+6. Where could a competitor's brand be converted to ours? (competitor conversion)
 
-And for new customers with no transaction history, a fallback ensures they still get useful recommendations:
+For new customers with no transaction history, a fallback ensures they still get useful recommendations:
 
 7. Cold-start popularity recommendations, biased toward the customer's specialty.
 
@@ -26,57 +34,34 @@ Each customer gets a top-10 list combining all signal types, ranked by confidenc
 
 ## Why segmentation matters
 
-A single global popularity ranking does not work for B2B medical supply distribution because customer needs vary by an order of magnitude based on what kind of medical practice they are. A long-term care facility buys enteral feeding pumps and incontinence products. A family practice clinic buys vaccines, alcohol prep pads, and exam gloves. A surgical center buys wound closure adhesives and sterile gloves. Recommending alcohol prep pads to an LTC facility is not wrong, but it misses what they actually need.
+A single global popularity ranking does not work for B2B medical supply because customer needs vary by an order of magnitude based on what kind of medical practice they are. A long-term care facility buys enteral feeding pumps and incontinence products. A family practice clinic buys vaccines, alcohol prep pads, and exam gloves. A surgical center buys wound closure adhesives and sterile gloves.
 
 So the project segments customers along multiple axes before running any recommendation logic.
 
-### Market segmentation (what kind of practice)
+### Market segmentation
 
-Customers are bucketed into six market types based on their primary purchase patterns:
+Customers are bucketed into seven market types based on their primary purchase patterns: PO (Physician Office), LTC (Long-Term Care), SC (Surgery Center), HC (Home Care), LC (Lab/Diagnostics), AC (Acute Care), and OTHER. Market is computed from the actual purchase mix, not from a customer-supplied "what kind of business are you" field, because customers misclassify themselves all the time.
 
-- **PO** (Physician Office): family practice, internal medicine, pediatrics, OB/GYN
-- **LTC** (Long-Term Care): nursing homes, assisted living, hospice
-- **SC** (Surgery Center): ambulatory surgery, outpatient procedures
-- **HC** (Home Care): home health agencies, in-home patient services
-- **LC** (Lab/Diagnostics): clinical labs, pathology
-- **AC** (Acute Care): hospitals, hospital systems
+### Size segmentation
 
-Market is computed from the actual purchase mix, not from a customer-supplied "what kind of business are you" field, because customers misclassify themselves all the time. The classifier looks at which product families the customer buys and how that distribution compares to known archetypes.
+Within each market, customers are bucketed into five size tiers: new (fewer than 2 active months), small (under $500/mo spend), mid ($500-$2,499/mo), large ($2,500-$14,999/mo), enterprise ($15,000+/mo). Each customer also has a volume tier (median monthly units). The final size tier is the lower of spend and volume, but never more than one tier below the spend tier (the `max_one` rule). This protects high-cost low-volume specialty Rx buyers from being placed in the wrong peer group.
 
-### Size segmentation (how big they are)
+Market crossed with size gives 32 final segments. This is the unit of comparison the recommendation engine uses when computing peer adoption.
 
-Within each market, customers are bucketed into five size tiers based on annual purchase volume:
+### Lifecycle status
 
-- **new**: less than 12 months of purchase history
-- **small**: bottom 40 percent of established customers in their market
-- **mid**: 40th to 80th percentile
-- **large**: 80th to 95th percentile
-- **enterprise**: top 5 percent
+Each customer is also tagged with a lifecycle status. These percentages are verified against the cleaned customer-patterns Parquet:
 
-Combining the two gives 30 final segments (PO_small, LTC_mid, AC_enterprise, etc.). This is the unit of comparison the recommendation engine uses when computing peer adoption: when we say "92 percent of PO_large peers buy infection prevention products," we mean 92 percent of the customers in this exact market-and-size bucket.
+- **stable_warm** (52.0%): Active customers ordering regularly
+- **cold_start** (26.8%): New customers with sparse or no transaction history
+- **churned_warm** (11.0%): Were active in FY24-25 but have stopped in FY25-26
+- **declining_warm** (10.2%): Active but slowing down
 
-### Lifecycle status (where the customer is in their journey)
+The combined declining and churned population is approximately 81,400 customers (21.2%), the at-risk segment where sales reps should focus engagement effort.
 
-Each customer is also tagged with a lifecycle status that captures their current engagement level:
+### Archetype and specialty
 
-- **stable_warm** (~52% of base): Active customers ordering regularly within their normal cadence
-- **declining_warm** (~10%): Active but slowing down, candidates for win-back
-- **churned_warm** (~11%): Were active recently but have stopped, top recovery priority
-- **cold_start** (~27%): New customers with sparse or no transaction history
-
-Status drives which signals dominate the recommendations. Churned customers get heavier lapsed-recovery weighting. Cold-start customers route to the popularity fallback path entirely. Stable customers get the full mix.
-
-### Archetype (clinical type)
-
-Each customer is also classified into one of ten clinical archetypes based on their product mix:
-
-- specialty_clinic, primary_care, skilled_nursing, surgery_center, educational, multispecialty_group, hospital_acute, government, pharmacy, veterinary
-
-This is exposed via the API and used for filtering and analytics.
-
-### Specialty as a secondary signal
-
-Beyond market, size, status, and archetype, each customer has a specialty code (FP for family practice, IM for internal medicine, OBG for OB/GYN, RL for radiology, HIA for home infusion, etc.) computed from their actual product mix. Specialty is used as a tiebreaker when ranking recommendations: if two products have similar peer-gap evidence, the one that aligns with the customer's specialty wins.
+Each customer is also classified into one of ten clinical archetypes (specialty_clinic, primary_care, skilled_nursing, surgery_center, educational, multispecialty_group, hospital_acute, government, pharmacy, veterinary). Beyond that, each customer has a specialty code (FP, IM, OBG, RL, HIA, etc.) used as a tiebreaker when ranking recommendations.
 
 ## How the recommendation engine works
 
@@ -84,90 +69,76 @@ The engine runs in two stages. The heavy lifting happens offline in a batch job 
 
 ### Offline stage: signal computation
 
-Multiple analyses run on the cleaned transaction data:
+**Peer adoption matrix.** For every product and every segment, compute what percentage of customers in that segment buy it. This is the foundation of the peer-gap signal.
 
-**Peer adoption matrix.** For every product in the catalog and every segment, compute what percentage of customers in that segment buy it. This is the foundation of the peer-gap signal. If 92 percent of PO_large peers buy a given product family and the target customer is in PO_large but does not buy any of that family, that is a peer gap worth surfacing.
+**Replenishment cadence.** For every customer-product pair, compute the typical days-between-purchases. If the gap exceeds the typical cadence by a meaningful margin, the product becomes a replenishment candidate.
 
-**Replenishment cadence.** For every customer-product pair where the customer has bought the product before, compute the typical days-between-purchases. If the gap since their last purchase exceeds the typical cadence by a meaningful margin, the product becomes a replenishment candidate.
+**Lapsed recovery.** Identifies products the customer used to buy regularly but has stopped ordering.
 
-**Lapsed recovery.** Identifies products the customer used to buy regularly but has stopped ordering. Critical for declining and churned customers where re-engagement is the goal.
+**Item co-occurrence.** Across the entire transaction history, compute lift, support, and confidence for every product pair. Produces about 42,800 high-lift pairs out of the roughly 27,773-product catalog.
 
-**Item co-occurrence.** Across the entire transaction history, compute lift, support, and confidence for every product pair that gets bought together more often than chance would predict. This produces a sparse matrix of about 42,000 product pairs out of the roughly 27,000-product catalog. These are the cart complements.
+**Private brand equivalents.** For every national-brand item, find the closest McKesson Brand alternative based on family, category, pack size, and price band. Roughly 9,500 such pairs.
 
-**Private brand equivalents.** For every national-brand item, find the closest private-brand alternative based on product family, category, pack size, and price band. Roughly 9,500 such pairs exist in the catalog. Anchor the swap with an estimated savings percentage so the API can show "save approximately 18 percent" in the pitch.
+**Competitor conversions.** Maps Medline and other competitor-brand products to in-house equivalents.
 
-**Competitor conversions.** Specifically maps competitor-brand products to in-house equivalents to support the brand-conversion play.
+**Item similarity.** Sarwar 2001 adjusted cosine on the customer-product matrix, sparse-matrix arithmetic over 389,000 customers and 27,000 products, producing 895,257 scored product pairs.
 
-**Item similarity.** Use TF-IDF on item descriptions plus structured features (family, category, supplier, price band) to compute a similarity score between every pair of items. This drives the cross-sell signal: customers like you tend to also use this similar item.
-
-**Popularity baseline.** Falls back to specialty-weighted popularity when no other signal applies (cold-start customers and edge cases).
+**Popularity baseline.** Falls back to specialty-weighted popularity when no other signal applies.
 
 ### Combining signals into a top-10
 
-Each candidate item for each customer gets a confidence score derived from how strong the underlying signal is (a 92 percent peer adoption rate is more confident than a 60 percent one), how relevant it is to the customer's history, and a brand strategy weight that nudges private-brand items higher when otherwise equivalent. A quota-based diversification system ensures the top 10 contains a mix of signal types rather than being dominated by one (median diversity: 4 distinct signals per customer, with all 8 signal types visible across the customer base).
+Each candidate gets a confidence score derived from the strength of the underlying signal. Signals are normalized to percentile ranks so peer_gap (raw scores 5 to 15) and item_similarity (raw scores 0.8 to 2) compete on equal footing.
 
-The pitch reason is generated at this stage, not at API request time. It is a templated string that pulls in the actual peer percentage, segment name, and specialty so it reads as a real explanation rather than boilerplate. Two examples of what gets stored:
+A quota-based diversification system ensures the top 10 contains a mix of signal types. Quotas: peer_gap=4, cart_complement=3, replenishment=3, item_similarity=2, lapsed_recovery=2, private_brand_upgrade=2, medline_conversion=2, popularity=10 (fallback). Without quotas, median signal diversity per customer was 1. With quotas, it jumped to 4.
+
+The pitch reason is a templated string that pulls in actual peer percentage, segment name, and specialty:
 
 > "92 percent of PO_large peers buy Infection Prevention products. You don't currently. Aligns with your specialty (FP)."
 
-> "You usually order this but haven't recently. 78 percent of peers in your segment still order it on a regular cadence. Likely due for reorder."
-
-Each recommendation is also tagged with a **business purpose** (`new_product`, `win_back`, `cross_sell`, `house_brand_substitute`) and a house-brand flag, so the dashboard can group recommendations by intent and the analytics layer can track house-brand penetration.
+Each recommendation is also tagged with a business purpose (`new_product`, `win_back`, `cross_sell`, `mckesson_substitute`) and a McKesson Brand flag.
 
 ### Online stage: API serves recommendations
 
-When a request comes in for a customer's top 10 recommendations, the API looks up the precomputed rows in the Parquet file using DuckDB, fetches the live inventory level for each item from Postgres, and returns the combined response. The Parquet read takes a few milliseconds. The Postgres join adds maybe one or two more.
+When a request comes in for a customer's top 10 recommendations, the API looks up the precomputed rows in the Parquet file using DuckDB, fetches the live inventory level for each item from Postgres, and returns the combined response.
 
-Two recommendation paths exist:
-
-1. **Precomputed path**: customer has rows in `recommendations.parquet`. Return them.
-2. **Cold-start path**: customer is brand new (created via the API after the analytics batch ran, so they have no precomputed recommendations). Query product popularity tables directly, sort by recent buyer count, apply a specialty boost, and return 10 popularity recommendations.
-
-The customer never sees which path was used. The response shape is identical, with a `recommendation_source` flag (`precomputed` or `cold_start`) so the frontend can render slightly different UI hints if it wants.
+Two recommendation paths exist: a precomputed path (customer has rows in `recommendations.parquet`) and a cold-start path (customer is brand new, query product popularity tables directly). The response shape is identical, with a `recommendation_source` flag.
 
 ### The cart helper is a separate flow
 
-Top 10 recommendations are static between batch runs. The cart helper runs live every time a cart changes. The caller can either pass a list of cart item IDs in the request body, or omit it and let the endpoint read the customer's active cart from the cart_items table in Postgres. Either way, the endpoint runs three queries against the Parquet files:
-
-- **Cart complements**: items frequently co-bought with the cart items, ranked by lift
-- **Private brand upgrades**: private-brand alternatives for any national-brand items in the cart
-- **Competitor conversions**: house-brand alternatives for any competitor-brand products in the cart
-
-Each list can have zero to a handful of items. Empty lists are valid responses. They mean no signal fired, not that the engine is broken.
+The cart helper runs live every time a cart changes. It runs three queries against the Parquet files: cart complements (items frequently co-bought with cart items), private brand upgrades (McKesson Brand alternatives for national-brand items in the cart), and competitor conversions (McKesson alternatives for competitor-brand products in the cart).
 
 ### Closing the loop: rejection feedback
 
-When a sales rep on the dashboard sees a recommendation that is not useful for their customer, they can reject it directly from the recommendation card. The reject flow captures one of nine reason codes (`not_relevant`, `already_have`, `out_of_stock`, `price_too_high`, `wrong_size_or_spec`, `different_brand`, `bad_timing`, `wrong_recommendation`, `other`) plus an optional free-text note, and writes the result to a `recommendation_events` table with `outcome='rejected'`. Rejected items disappear from the seller's view for the rest of their session.
+When a sales rep sees a recommendation that is not useful, they can reject it directly from the recommendation card with one of nine reason codes plus an optional free-text note. The rejection writes to `recommendation_events` with `outcome='rejected'` and the item disappears from the seller's view for the rest of their session.
 
-These signals are not just logged for an audit trail. The admin dashboard rolls them up into an Engine Effectiveness panel that shows per-signal funnel metrics: cart adds, sold conversions, rejections, conversion rate, acceptance rate, rejection rate, and revenue. This closes the loop between what the engine surfaces and what sellers actually find useful, and makes it possible to identify weak signals (high rejection rate, low conversion) versus strong ones.
+These signals roll up into the admin dashboard's Engine Effectiveness panel showing per-signal funnel metrics: cart adds, sold conversions, rejections, conversion rate, acceptance rate, rejection rate, and revenue.
 
 ## Validation results
 
-The recommendation logic was validated against held-out transaction data before any of it was wired into an API.
+The recommendation logic was validated using three independent methods:
 
-| Metric                          | Result        | Baseline       |
-|---------------------------------|---------------|----------------|
-| Family hit rate (90-day window) | **91.9%**     | 70.2%          |
-| Median cart complement lift     | **49.94x**    | 1.0x (random)  |
-| House-brand share               | **~57%**      | Target: 56.6%  |
-| Customer coverage               | **97.6%**     | 379,729 / 389,224 |
-| Strict SKU hit rate             | 1.8%          | (by design - engine excludes already-bought items) |
-| Specialty filter breaches       | **0**         | -              |
+| Metric                          | Result        | Baseline / Notes |
+|---------------------------------|---------------|------------------|
+| Family hit rate (60-day holdout)| **91.9%**     | 70.2% popularity baseline (+21.8 pp lift) |
+| Median cart complement lift     | **49.94x**    | 1.0x random (across 100 stratified carts) |
+| Cart helper trigger rate        | **59%**       | At least one suggestion on 59 of 100 real carts |
+| McKesson Brand share overall    | **56.7%**     | Per-signal: 26% (popularity) to 100% (PB upgrade) |
+| Customer coverage               | **97.6%**     | 380,813 / 389,224 customers |
+| Specialty filter breaches       | **0**         | Across 60 customers in 30 segments |
+| Strict SKU hit rate             | 1.8%          | By design - 89% of holdout activity was replenishment |
 
-Both metrics held when the engine was moved from the offline batch into the API.
+The strict SKU number is intentionally low. The engine focuses on the 11% of customer activity that is genuinely new product purchases, not the 89% that is replenishment.
 
 ## Architecture
 
-The system is split into two stores, each doing what it is best at, plus a React frontend that consumes the API.
-
 | Layer    | What lives there                                                                                | Why                                          |
 |----------|-------------------------------------------------------------------------------------------------|----------------------------------------------|
-| Postgres | Users, customers, products, inventory, cart, purchase history, customer-seller assignments and history, recommendation events (with rejection tracking) | Live transactional state, ACID writes  |
+| Postgres | Users, customers (with status and archetype), products, inventory, cart, purchase history, customer-seller assignments and history, recommendation events with rejection tracking | Live transactional state, ACID writes  |
 | Parquet  | Precomputed recommendations, segment metadata, co-occurrence pairs, private-brand equivalents, item similarity | Columnar reads via DuckDB, no joins needed   |
 | FastAPI  | All HTTP endpoints, JWT auth, role-based authorization, Pydantic validation                     | Bridges the two stores, runs the cold-start fallback |
 | React    | Three role-gated workspaces (admin, seller, customer) with TanStack Query, Tailwind, Vite       | Real dashboard for selling, browsing, and operating the system |
 
-The API stitches both stores together at request time. DuckDB reads the Parquet for the recommendation list, then SQLAlchemy fetches the inventory level for each item from Postgres before returning the response. This keeps the analytics pipeline decoupled from the live API. The analytics batch can be rerun nightly without touching the running API process.
+The API stitches both stores together at request time. DuckDB reads the Parquet for the recommendation list, then SQLAlchemy fetches the inventory level for each item from Postgres before returning the response. The analytics batch can be rerun nightly without touching the running API process.
 
 ## Repository layout
 
@@ -179,16 +150,11 @@ The API stitches both stores together at request time. DuckDB reads the Parquet 
 ├── .gitignore
 │
 ├── backend/                      FastAPI application
-│   ├── main.py                   App entry point, registers routers
-│   ├── config.py                 Pydantic-settings configuration
-│   ├── core/
-│   │   ├── dependencies.py       Auth dependencies (require_admin, etc.)
-│   │   ├── display_names.py      Code-to-label translation for the API layer
-│   │   └── security.py           JWT and bcrypt helpers
-│   ├── db/
-│   │   ├── database.py           Async SQLAlchemy engine and session
-│   │   └── parquet_store.py      DuckDB query helpers for Parquet files
-│   ├── models/                   SQLAlchemy ORM models (10 tables)
+│   ├── main.py
+│   ├── config.py
+│   ├── core/                     Auth, security, display name helpers
+│   ├── db/                       SQLAlchemy engine and DuckDB Parquet helpers
+│   ├── models/                   SQLAlchemy ORM models
 │   ├── schemas/                  Pydantic request and response models
 │   ├── services/                 Business logic
 │   └── routers/                  FastAPI route definitions
@@ -197,161 +163,87 @@ The API stitches both stores together at request time. DuckDB reads the Parquet 
 │   ├── package.json
 │   ├── vite.config.js
 │   ├── tailwind.config.js
-│   ├── index.html
 │   └── src/
-│       ├── main.jsx              Entry point
-│       ├── App.jsx               Top-level layout
-│       ├── router.jsx            Role-gated route table
-│       ├── auth.jsx              Auth context (login, logout, current user)
-│       ├── api.js                Typed API client (axios + JWT)
-│       ├── lib/                  Display helpers (signals, purposes,
-│       │                         lifecycle, customer labels, formatters)
+│       ├── main.jsx, App.jsx, router.jsx, auth.jsx, api.js
+│       ├── lib/                  Display helpers
 │       ├── components/
-│       │   ├── shell/            AppShell, TopBar, Sidebar
-│       │   ├── ui/               Card, Badge, StatCard, Spinner, etc.
+│       │   ├── shell/            AppShell, TopBar, Sidebar (collapsible)
+│       │   ├── ui/               Card, Badge, StatCard, Spinner
 │       │   ├── charts/           HorizontalBarChart, LineChart
-│       │   ├── recs/             RecommendationCard, RecommendationList,
-│       │   │                     RejectRecommendationModal, PitchReason
+│       │   ├── recs/             Recommendation cards, reject modal, pitch reason
 │       │   ├── cart/             CartView, CartHelperPanel, CartItemRow
-│       │   ├── catalog/          CatalogBrowse, VariantPickerModal
-│       │   ├── customer/         ReorderHeatmap, CategoryDonut,
-│       │   │                     SuggestedCarousel, InventoryGauge
-│       │   ├── customer-mgmt/    CreateCustomerRecordModal (seller flow)
-│       │   ├── admin/            EngineEffectivenessPanel, TopCustomersPanel
-│       │   ├── sales/            RecentSalesFeed
-│       │   ├── perf/             PerformancePanel
-│       │   └── history/          OrderHistoryView
+│       │   ├── catalog/          Catalog browse, variant picker
+│       │   ├── customer/         Heatmap, donut, carousel, gauge
+│       │   ├── admin/            Engine effectiveness panel, top customers panel
+│       │   └── perf/             Performance panel
 │       └── pages/
-│           ├── LoginPage.jsx
-│           ├── ChangePasswordPage.jsx          (any logged-in user)
-│           ├── admin/
-│           │   ├── AdminOverview.jsx           Dashboard KPIs + engine
-│           │   │                               effectiveness + sales trend
-│           │   │                               + top customers
-│           │   ├── AdminUserManagement.jsx
-│           │   ├── AdminCustomers.jsx
-│           │   ├── AdminCustomerDetail.jsx
-│           │   ├── AdminSellers.jsx
-│           │   ├── AdminSellerDetail.jsx
-│           │   ├── AdminProducts.jsx
-│           │   ├── AdminCatalog.jsx
-│           │   └── AdminRecommendations.jsx
-│           ├── seller/
-│           │   ├── SellerCustomerList.jsx      My / All tabs, Add customer
-│           │   ├── SellerCustomerProfile.jsx   Overview / Cart / History /
-│           │   │                               Recs / Catalog
-│           │   ├── SellerCatalog.jsx
-│           │   └── SellerPerformance.jsx
-│           └── customer/
-│               ├── CustomerOverview.jsx
-│               ├── CustomerRecommendations.jsx
-│               ├── CustomerCart.jsx
-│               ├── CustomerCatalog.jsx
-│               └── CustomerOrders.jsx
+│           ├── LoginPage, ChangePasswordPage
+│           ├── admin/            Overview, Users, Customers, Sellers, Products
+│           ├── seller/           CustomerList, CustomerProfile, Catalog, Performance
+│           └── customer/         Overview, Recs, Cart, Catalog, Orders
 │
 ├── scripts/
-│   ├── analysis/                 Offline analytics (segmentation, signal computation)
-│   ├── backend/                  Database seeding and import scripts
+│   ├── analysis/                 Offline analytics
+│   ├── backend/                  DB seeding and import
 │   ├── cleaning/                 Raw data cleaning
 │   ├── profiling/                Data quality profiling
-│   ├── setup/                    Customer enrichment, demo data loaders,
-│   │                             password resets, customer/product ranking report
+│   ├── setup/                    Customer enrichment, demo loaders, password resets
 │   ├── audit/                    Pipeline audits
-│   └── qc/                       Comprehensive API test runner
+│   └── qc/                       API test runner
 │
 ├── sql/
 │   ├── init.sql                  One-shot database setup
-│   └── 2026_05_01_rejection_tracking.sql   Migration that adds rec_purpose,
-│                                           rejection_reason_code,
-│                                           rejection_reason_note,
-│                                           rejected_by_user_id columns +
-│                                           supporting indexes to
-│                                           recommendation_events
+│   └── migrations/               Schema migrations
 │
-├── tests/
-│   └── test_scripts/             Schema inspection and data sanity scripts
+├── tests/                        Schema and data sanity scripts
+├── docs/                         Business documents
 │
-├── docs/                         Business and proposal documents
-│
-├── data_raw/                     Raw input data (gitignored)
-├── data_clean/                   Cleaned and computed Parquet files (gitignored)
-├── analysis_outputs/             Generated reports and Excel summaries (gitignored)
-└── archive/                      Old test reports, debug scripts, legacy zips (gitignored)
+├── data_raw/                     Raw input (gitignored)
+├── data_clean/                   Cleaned and computed Parquet (gitignored)
+├── analysis_outputs/             Generated reports (gitignored)
+└── archive/                      Legacy files (gitignored)
 ```
 
-Data files, generated outputs, logs, and images are intentionally not tracked by git. See `.gitignore` for the full exclusion list.
+Data files, generated outputs, logs, and images are intentionally not tracked by git.
 
 ## What's in the API
 
-The API has 44 endpoints across ten routers.
+The API has 44 endpoints across ten routers covering health checks, JWT authentication, user management, customer search and creation, recommendations (top-10 and cart helper), customer-seller assignment with full audit trail, cart management, purchase history, and admin/seller/customer-scoped stats and dashboards.
 
-**Health checks** verify the app is alive, Postgres is reachable, and DuckDB can read the Parquet files.
-
-**Authentication** uses JWT bearer tokens. Login returns a token that the client passes on every subsequent request. The standard OAuth2 password flow is used so the interactive Swagger UI can authenticate via the Authorize button.
-
-**User management** lets admins create admins, sellers, and customers, list users, view individual users, deactivate or reactivate accounts, and lets users change their own password (`PATCH /users/me/password`). When a seller is deactivated, all their assigned customers are auto-unassigned with a count returned in the response.
-
-**Customer search and creation.** Sellers and admins can search by customer ID, market code, specialty, or segment. Admins can filter customers by lifecycle status, archetype, or any combination. A separate endpoint (`POST /customers/record`) creates a customer record without a user login - sellers use this to onboard a new account and have it auto-assigned to themselves; admins can use the same endpoint with an explicit `assigned_seller_id` to assign on behalf of someone else.
-
-**Recommendations** returns the top 10 for the logged-in customer, the top 10 for any specific customer (admin or assigned seller), or live cart suggestions. Sellers can also reject a recommendation with a reason code via `POST /recommendations/reject`, which writes to `recommendation_events` for engine feedback.
-
-**Customer-seller assignment** is the layer that controls who sees what. An admin can assign, reassign, or unassign customers individually or in bulk. A seller can self-claim any unassigned customer. Every change is recorded in an audit table with a reason code and a free-text note. An admin can pull the full assignment history for any customer at any time. The system rejects redundant no-op assignments to keep the audit log clean.
-
-**Cart management** lets sellers, admins, and customers add items to a customer's cart, view the active cart with line totals and inventory, update quantities, mark items as sold or not_sold, remove items, and check out. Checkout is atomic: it flips the cart line to sold and writes a corresponding row to purchase history in a single transaction. Each cart add is tagged with which recommendation signal drove it (one of nine valid sources), so the business can later measure conversion rates per signal.
-
-**Stats and dashboards** provide admin-scope KPIs (total revenue, conversion rate, customer counts, sales trends, segment distribution, top sellers, top customers, recent sales feed), seller-scope drill-downs (own customers, own conversion by signal), per-customer drill-downs, and the engine effectiveness funnel (`GET /admin/stats/engine-effectiveness`) that joins cart conversions and recommendation rejections into a per-signal report.
+Each cart add is tagged with which recommendation signal drove it, so the business can later measure conversion rates per signal. The engine effectiveness endpoint joins cart conversions and recommendation rejections into a per-signal report.
 
 ## What's in the frontend
 
-The dashboard is a single-page React app. It is role-gated: the route a user lands on is decided by their role, and the navigation, panels, and actions adapt to that role.
+The dashboard is a single-page React app, role-gated so the route a user lands on is decided by their role.
 
-**Admin workspace.** Platform-wide overview with KPIs, sales trend chart, engine effectiveness funnel (per-signal cart adds, sold, rejections, conversion rate, acceptance rate, rejection rate, revenue), top customers leaderboard, top sellers leaderboard, recent sales feed, customer browser, seller browser, full user management (create admin / seller / customer with dropdowns for market, size tier, and provider specialty), product catalog browser.
+**Admin workspace.** Platform-wide overview with KPIs, sales trend chart, engine effectiveness funnel, top customers leaderboard, top sellers leaderboard, recent sales feed, customer browser, seller browser, full user management, product catalog browser.
 
-**Seller workspace.** Two tabs on the customer list: "My customers" (assigned to me) and "All customers" (read-only browse, with claim action on unassigned rows). The seller can add a new customer record from a button on the list which pre-assigns it to them and routes them straight into the new customer's profile. Inside a customer profile: overview tab with KPI tiles, recommendations tab with the top 10 cards (each showing signal, purpose, brand flags, pitch reason, confidence; reject action available), cart tab with the cart helper running live as items are added, history tab with past purchases, catalog tab for direct browsing.
+**Seller workspace.** Two tabs on the customer list: "My customers" (assigned) and "All customers" (read-only browse, with claim action on unassigned rows). Inside a customer profile: overview tab with KPI tiles, recommendations tab with top 10 cards, cart tab with the cart helper running live, history tab, catalog tab.
 
 **Customer workspace.** Customers see their own overview (spend KPIs, recent orders, suggested carousel, category mix, replenishment heatmap), their own top 10 recommendations, their own cart with the cart helper, their order history, and a catalog browse view.
 
-**Shared.** Top-bar avatar menu has a Change Password link available to all roles, navigating to a self-service page that calls `PATCH /users/me/password`.
+**Shared.** The sidebar can be collapsed to icon-only mode and the state persists across page refreshes. The top-bar avatar menu has a Change Password link available to all roles.
 
 ## Authorization model
 
-Three roles with different scopes, enforced server-side on every endpoint.
-
-- **Admin**: full access. Sees and manages all users, all customers, all assignments. Can create customer records assigned to any seller. Sees the engine effectiveness panel.
-- **Seller**: scoped to assigned customers by default. Can browse all customers read-only. Can claim unassigned customers. Can create new customer records auto-assigned to themselves. Can reject recommendations for their own customers.
+- **Admin**: full access. Sees and manages all users, all customers, all assignments. Sees the engine effectiveness panel.
+- **Seller**: scoped to assigned customers by default. Can browse all customers read-only. Can claim unassigned customers. Can create new customer records auto-assigned to themselves. Can reject recommendations.
 - **Customer**: scoped to self. Can view own profile, own history, own recommendations, and run the cart helper for own cart only.
 
 All three roles can change their own password.
 
-Tests verify that a seller calling another seller's customer list gets 403, that a customer calling cart-helper for another customer gets 403, that a customer calling the reject endpoint gets 403 (sellers only), and that an unauthenticated request to any non-public endpoint gets 401.
-
 ## Testing and QC
 
-A comprehensive automated QC test runner lives at `scripts/qc/run_api_tests.py`. It auto-discovers users from the database (no hardcoded credentials), runs **128 distinct test cases** across 12 categories, and generates a multi-sheet Excel report with detailed expected vs actual JSON, pass/fail reasoning, and authorization matrix coverage.
+A comprehensive automated QC test runner lives at `scripts/qc/run_api_tests.py`. It auto-discovers users from the database, runs **128 distinct test cases** across 12 categories, and generates a multi-sheet Excel report.
 
-Categories tested:
-- Health (3 tests)
-- Authentication (13 tests)
-- User management lifecycle (15 tests)
-- Customer endpoints including filter (15 tests)
-- Recommendations across all 4 lifecycle statuses (10 tests)
-- Cart workflow with all 9 source types (16 tests)
-- Purchase history (3 tests)
-- Assignment lifecycle (12 tests)
-- Stats - admin/seller/customer scopes (9 tests)
-- Authorization matrix - 14 endpoints x 3 roles (32 tests)
+Categories: Health (3), Authentication (13), User management (15), Customer endpoints (15), Recommendations across 4 lifecycle statuses (10), Cart workflow with all 9 source types (16), Purchase history (3), Assignment lifecycle (12), Stats - admin/seller/customer (9), Authorization matrix - 14 endpoints x 3 roles (32).
 
 **Latest run: 127/128 passed (99.2%).** The single non-pass is the system correctly rejecting a redundant assignment operation, which is the assignment-history integrity feature working as designed.
 
-To run:
-
 ```bash
-# From project root
 python scripts/qc/run_api_tests.py
 # Output: api_test_report_<timestamp>.xlsx
 ```
-
-Schema inspection and data sanity checks live in `tests/test_scripts/` and `scripts/analysis/sanity_check_recommendations.py`.
 
 ## Setup
 
@@ -368,22 +260,13 @@ Schema inspection and data sanity checks live in `tests/test_scripts/` and `scri
 git clone <your-repo-url>
 cd <project-folder>
 
-# Using conda (recommended)
 conda create -n CTBA python=3.10
 conda activate CTBA
 
-# Or using venv
-python -m venv venv
-source venv/bin/activate         # macOS/Linux
-venv\Scripts\activate            # Windows PowerShell
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ### 2. Configure environment
-
-Copy the template and fill in your local Postgres connection details:
 
 ```bash
 cp .env.example .env
@@ -415,32 +298,22 @@ CREATE DATABASE recommendation_dashboard;
 
 Open `sql/init.sql` in DBeaver against the new database and execute it. This creates the `recdash` schema, all tables, indexes, and foreign keys.
 
-Then run the rejection-tracking migration to add the new columns introduced for the engine-feedback feature:
-
-```bash
-# Run sql/2026_05_01_rejection_tracking.sql in DBeaver
-```
-
-It is idempotent (uses `IF NOT EXISTS` everywhere) so it is safe to re-run.
+Then run any migrations in `sql/migrations/` to add later schema additions like rejection tracking. Migrations are idempotent (use `IF NOT EXISTS`) so they are safe to re-run.
 
 ### 5. Run the data pipeline
 
 ```bash
-# Clean raw transactions
 python scripts/cleaning/clean_data.py
 
-# Segment customers and products
 python scripts/analysis/segment_customers.py
 python scripts/analysis/segment_products.py
 python scripts/analysis/segment_patterns.py
 
-# Compute the signal sources
 python scripts/analysis/compute_product_specialty.py
 python scripts/analysis/compute_product_cooccurrence.py
 python scripts/analysis/compute_private_brand_equivalents.py
 python scripts/analysis/compute_item_similarity.py
 
-# Build the recommendation factor scores
 python scripts/analysis/recommendation_factors.py
 ```
 
@@ -456,13 +329,8 @@ python scripts/backend/copy_purchase_history.py
 ### 7. Enrich customers and seed demo users
 
 ```bash
-# Add status and archetype columns to the customers table
 python scripts/setup/enrich_customers_table.py
-
-# Create demo customer users (one per status x segment combination)
 python scripts/setup/load_demo_users_and_history.py
-
-# Reset admin and seller passwords to a known value (Demo1234!)
 python scripts/setup/reset_password.py
 ```
 
@@ -494,8 +362,6 @@ Open http://localhost:5173 (or whichever port Vite reports). Log in with any of 
 python scripts/qc/run_api_tests.py
 ```
 
-This will produce `api_test_report_<timestamp>.xlsx` with full pass/fail evidence across 128 test cases.
-
 ## Tech stack
 
 | Layer              | Technology                                  |
@@ -511,8 +377,46 @@ This will produce `api_test_report_<timestamp>.xlsx` with full pass/fail evidenc
 | ML and similarity  | scikit-learn, scipy, implicit, lightgbm     |
 | Auth               | python-jose (JWT), passlib (bcrypt)         |
 | Output             | openpyxl (Excel reports), matplotlib        |
-| Frontend           | React 18, Vite, Tailwind CSS, TanStack Query, axios, lucide-react, recharts |
+| Frontend           | React 19, Vite, Tailwind CSS, TanStack Query, axios, lucide-react, recharts |
+
+## Future enhancements
+
+The engine validates well on offline data and runs end-to-end through a working dashboard. Several enhancements are natural next steps for a production rollout.
+
+### Near-term (v2 roadmap)
+
+**Nightly automated pipeline.** Today the pipeline runs as a one-time job on a developer laptop. Production would need a scheduled nightly run on McKesson infrastructure with monitoring, alerting, and proper error recovery.
+
+**Multi-location chain awareness.** Hospital systems with multiple locations currently appear as separate customer records with no parent-child relationship. A 10-location hospital system gets 10 separate recommendation sets rather than chain-aware ones. Adding a chain-relationship layer would let the engine recognize purchasing patterns at the system level.
+
+**Learned ranker on top of the eight signals.** The current engine combines signals through normalized scores and quotas. Once acceptance and rejection feedback accumulates from real sellers using the dashboard, a learned ranker (e.g., LightGBM trained on accepted vs rejected recommendations) could replace the manual quota system and continuously improve.
+
+**CRM integration for account status.** The engine currently infers customer health from purchasing patterns because no account-status flag exists in the source data. Joining real CRM data would let the engine distinguish "paused" from "churned" from "closed" and route recommendations accordingly.
+
+**Catalog gap reporting.** About 3.3 percent of customers (12,353 accounts) receive zero McKesson recommendations because they buy in niches where the catalog has no alternatives (Rx-only, lab reagents only). A regular report flagging these accounts could feed back into McKesson's catalog expansion priorities.
+
+**Real-time inventory awareness in the cart helper.** The cart helper currently does not penalize out-of-stock items in its suggestions. Real-time inventory checks at suggestion time would prevent surfacing items the customer cannot actually order today.
+
+### Medium-term
+
+**Refresh cadences per signal.** Replenishment and lapsed_recovery would benefit from more frequent recomputation than peer_gap or item_similarity. A tiered refresh schedule (cart-helper data hourly, replenishment daily, peer-gap weekly, item-similarity monthly) would balance freshness against compute cost.
+
+**Specialty model improvements.** Customers can be multi-specialty (a clinic with both family practice and OB/GYN), but the current engine assigns one specialty per customer. A multi-label specialty model would handle this more accurately.
+
+**Per-rep configuration.** Different sales reps may have different priorities. An admin-controlled config layer letting reps weight signals (favor brand conversion, favor replenishment, etc.) without changing the underlying engine would make the dashboard more flexible.
+
+**Dashboard analytics deep-dive.** The current admin overview shows engine effectiveness at a high level. A dedicated analytics workspace with cohort views, signal drill-downs, time-series, and exportable reports would help business analysts evaluate engine impact rigorously.
+
+### Long-term
+
+**Production deployment with HIPAA controls.** The current setup is local-only for compliance reasons. A production deployment would need formal HIPAA review, BAAs in place, and infrastructure that satisfies McKesson's enterprise security standards.
+
+**Multi-tenant capability.** If McKesson wanted to extend the engine to other distributor brands or partners, the architecture supports this with minor changes (segment definitions, brand maps, and pitch-reason templates would parameterize per tenant).
+
+**Self-service rep dashboards.** Today reps see what the dashboard shows them. A future enhancement could let reps build their own slice-and-dice views, save customer search queries, set up alerts for at-risk customers.
+
+**API-first integrations.** The recommendation Parquet output is the long-term asset. The dashboard demonstrates capability, but the same Parquet output could feed McKesson's existing CRM, sales enablement tools, or quote generation systems through a well-defined API contract.
 
 ## License
 
-This project is part of an academic capstone at William & Mary. Not licensed for commercial use without permission.
+This project is part of an academic capstone at William and Mary. Not licensed for commercial use without permission.

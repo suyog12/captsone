@@ -5,9 +5,9 @@ CREATE SCHEMA IF NOT EXISTS recdash;
 SET search_path TO recdash, public;
 
 
--- STEP 2: Core tables (8 tables + assignment history)
+-- STEP 2: Core tables
 
--- 1. Users (admin, seller, customer login accounts)
+-- Users: admin, seller, customer login accounts
 CREATE TABLE IF NOT EXISTS recdash.users (
     user_id         SERIAL PRIMARY KEY,
     username        VARCHAR(100) UNIQUE NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS recdash.users (
 CREATE INDEX IF NOT EXISTS idx_users_is_active ON recdash.users(is_active);
 
 
--- 2. Customers (the 389K imported business customers)
+-- Customers: 389K imported business customers with lifecycle and segmentation
 CREATE TABLE IF NOT EXISTS recdash.customers (
     cust_id              BIGINT PRIMARY KEY,
     customer_name        VARCHAR(200),
@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS recdash.customers (
     market_code          VARCHAR(20),
     segment              VARCHAR(50),
     supplier_profile     VARCHAR(50),
+    status               VARCHAR(20),
+    archetype            VARCHAR(50),
     assigned_seller_id   INT REFERENCES recdash.users(user_id),
     assigned_at          TIMESTAMP,
     created_at           TIMESTAMP DEFAULT NOW()
@@ -39,9 +41,10 @@ CREATE TABLE IF NOT EXISTS recdash.customers (
 
 CREATE INDEX IF NOT EXISTS idx_customers_assigned_seller ON recdash.customers(assigned_seller_id);
 CREATE INDEX IF NOT EXISTS idx_customers_market_code     ON recdash.customers(market_code);
+CREATE INDEX IF NOT EXISTS idx_customers_status          ON recdash.customers(status);
 
 
--- 3. Products (the 27,773 catalog items)
+-- Products: 27,773 engine-eligible catalog items
 CREATE TABLE IF NOT EXISTS recdash.products (
     item_id           BIGINT PRIMARY KEY,
     description       VARCHAR(500),
@@ -59,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_products_family   ON recdash.products(family);
 CREATE INDEX IF NOT EXISTS idx_products_category ON recdash.products(category);
 
 
--- 4. Inventory (live stock tracked in Postgres, one row per product)
+-- Inventory: live stock per product
 CREATE TABLE IF NOT EXISTS recdash.inventory (
     item_id           BIGINT PRIMARY KEY REFERENCES recdash.products(item_id) ON DELETE CASCADE,
     units_available   INT NOT NULL DEFAULT 0 CHECK (units_available >= 0),
@@ -68,7 +71,7 @@ CREATE TABLE IF NOT EXISTS recdash.inventory (
 );
 
 
--- 5. Cart items (the working state of a sales conversation)
+-- Cart items: working cart state with sales rep / customer attribution
 CREATE TABLE IF NOT EXISTS recdash.cart_items (
     cart_item_id        SERIAL PRIMARY KEY,
     cust_id             BIGINT NOT NULL REFERENCES recdash.customers(cust_id),
@@ -94,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_cart_items_status      ON recdash.cart_items(stat
 CREATE INDEX IF NOT EXISTS idx_cart_items_cust_status ON recdash.cart_items(cust_id, status);
 
 
--- 6. Purchase history (committed transactions)
+-- Purchase history: committed transactions
 CREATE TABLE IF NOT EXISTS recdash.purchase_history (
     purchase_id         SERIAL PRIMARY KEY,
     cust_id             BIGINT NOT NULL REFERENCES recdash.customers(cust_id),
@@ -111,7 +114,7 @@ CREATE INDEX IF NOT EXISTS idx_purchase_history_sold_at  ON recdash.purchase_his
 CREATE INDEX IF NOT EXISTS idx_purchase_history_seller   ON recdash.purchase_history(sold_by_seller_id);
 
 
--- 7. Recommendation events (which recs were shown to whom, what happened)
+-- Recommendation events: tracks which recs were shown and what happened
 CREATE TABLE IF NOT EXISTS recdash.recommendation_events (
     event_id          SERIAL PRIMARY KEY,
     cust_id           BIGINT NOT NULL REFERENCES recdash.customers(cust_id),
@@ -130,7 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_rec_events_outcome   ON recdash.recommendation_ev
 CREATE INDEX IF NOT EXISTS idx_rec_events_shown_at  ON recdash.recommendation_events(shown_at);
 
 
--- 8. Activity log (audit trail for all user actions)
+-- Activity log: audit trail for all user actions
 CREATE TABLE IF NOT EXISTS recdash.activity_log (
     log_id        SERIAL PRIMARY KEY,
     user_id       INT REFERENCES recdash.users(user_id),
@@ -146,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_created_at  ON recdash.activity_log(
 CREATE INDEX IF NOT EXISTS idx_activity_log_action      ON recdash.activity_log(action);
 
 
--- 9. Customer assignment history (full audit trail of seller-customer assignments)
+-- Customer assignment history: full audit trail of seller-customer assignments
 CREATE TABLE IF NOT EXISTS recdash.customer_assignment_history (
     history_id          BIGSERIAL PRIMARY KEY,
     cust_id             BIGINT NOT NULL REFERENCES recdash.customers(cust_id),
@@ -173,19 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_cust_assign_history_changed_at
     ON recdash.customer_assignment_history(changed_at);
 
 
--- STEP 3: Seed initial users for development and demo
--- These three users let you log into the API immediately after setup.
--- All three have well-known capstone credentials. Change before any
--- non-development use.
---
--- Login credentials (capstone-only):
---   admin    / admin123
---   seller   / seller123
---   customer / customer123
---
--- The seed customer record (cust_id=16016658) must exist in the customers
--- table for the customer login to be useful, so the import scripts must
--- run before this user becomes fully functional.
+-- STEP 3: Seed users
 
 INSERT INTO recdash.users (username, password_hash, role, full_name, email)
 VALUES
@@ -201,22 +192,9 @@ VALUES
      'seller@capstone.local')
 ON CONFLICT (username) DO NOTHING;
 
-INSERT INTO recdash.users (username, password_hash, role, full_name, email, cust_id)
-VALUES
-    ('customer',
-     '$2b$12$T4In925yyfqLwpFU0M5.9Oey2cGOIZ48Ib4qTa56POjcm3BWiNqfG',
-     'customer',
-     'Test Customer',
-     'customer@capstone.local',
-     16016658)
-ON CONFLICT (username) DO NOTHING;
-
 
 -- STEP 4: Verification queries
--- Run these manually in DBeaver after the setup script completes to verify
--- that everything was created correctly.
 
--- 4a. All FKs should point at recdash.* tables (not public.*)
 SELECT
     tc.table_schema || '.' || tc.table_name AS source_table,
     kcu.column_name AS source_column,
@@ -230,12 +208,10 @@ WHERE tc.constraint_type = 'FOREIGN KEY'
   AND tc.table_schema = 'recdash'
 ORDER BY tc.table_name, kcu.column_name;
 
--- 4b. Confirm seed users were created
 SELECT user_id, username, role, full_name, email, cust_id, is_active
 FROM recdash.users
 ORDER BY user_id;
 
--- 4c. Row counts for the data tables (will be 0 until import scripts run)
 SELECT
     (SELECT COUNT(*) FROM recdash.customers)                     AS customers,
     (SELECT COUNT(*) FROM recdash.products)                      AS products,

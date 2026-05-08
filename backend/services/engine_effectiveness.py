@@ -1,19 +1,3 @@
-"""
-Engine effectiveness service.
-
-This file provides ONE function: get_engine_effectiveness(). Append the
-import and the function body to backend/services/stats_service.py, and
-register the route in backend/routers/stats.py.
-
-The function returns a per-signal funnel of:
-  - cart adds attributable to that signal
-  - sold (cart -> sold conversions)
-  - rejected (sellers actively rejected this signal's recs)
-
-The signal axis joins cart_items.source (mapped to a 'signal' code) with
-recommendation_events.signal so a single key per signal lines them up.
-"""
-
 from __future__ import annotations
 
 from decimal import Decimal
@@ -63,7 +47,6 @@ SIGNAL_DISPLAY = {
 
 async def get_engine_effectiveness(db: AsyncSession) -> dict:
     """Return a per-signal funnel: adds -> sold + rejected.
-
     Numerator/denominator math used by the admin panel:
       adds            : count of cart_items WHERE source = recommendation_*
       sold            : adds with status = 'sold'

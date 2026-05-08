@@ -1,10 +1,3 @@
-"""
-Append the contents of this file to backend/schemas/customer.py.
-Adds CustomerRecordCreateRequest used by POST /customers/record (seller
-auto-assignment workflow) and CustomerRecordCreateResponse to return the
-created customer.
-"""
-
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -16,7 +9,6 @@ class CustomerRecordCreateRequest(BaseModel):
     Used by the seller workflow (auto-assigns to current seller) and
     by admins who want to create a customer without a login account.
     """
-
     customer_business_name: str = Field(
         ..., min_length=2, max_length=200,
         description="Business / account name shown in the customer roster.",

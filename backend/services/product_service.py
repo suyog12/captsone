@@ -1,11 +1,3 @@
-"""
-Product catalog service.
-
-Joins recdash.products with recdash.inventory so each row carries the
-current stock count along with description, family, category, supplier,
-private-brand flag, and price. Used by the catalog browse endpoint.
-"""
-
 from __future__ import annotations
 
 from typing import Optional

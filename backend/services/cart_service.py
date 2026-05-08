@@ -1,28 +1,3 @@
-"""
-Cart-management service (Phase 5.6).
-
-Functions:
-    add_item(...)            Add an item to a customer's cart, or bump quantity
-                             if the item is already in_cart.
-    list_for_customer(...)   List cart lines for a customer, filtered by status.
-    update_quantity(...)     Change the quantity on an in_cart line.
-    update_status(...)       Mark an in_cart line as sold or not_sold (no
-                             purchase_history write).
-    delete_item(...)         Hard-delete an in_cart line.
-    checkout_item(...)       Mark an in_cart line as sold AND insert the
-                             corresponding row into purchase_history.
-
-Business rules enforced here:
-    - quantity > 0 (also enforced by Pydantic and DB CHECK constraint)
-    - update_quantity, update_status, delete_item only work on lines that
-      currently have status='in_cart'
-    - add_item collapses duplicates: if the same (cust_id, item_id) is
-      already in_cart, the existing row gets its quantity bumped by the
-      requested quantity, instead of a second row being created
-    - checkout_item is atomic: either both the cart status flip AND the
-      purchase_history INSERT happen, or neither does
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -43,7 +18,6 @@ from backend.models import (
 
 
 # Add to cart
-
 async def add_item(
     db: AsyncSession,
     *,
@@ -76,9 +50,6 @@ async def add_item(
     elif user.role == "customer":
         added_by_role = "customer"
     elif user.role == "admin":
-        # Admins acting on behalf of a customer are recorded as 'seller'
-        # because that's what the CHECK constraint allows and it most
-        # accurately describes the action.
         added_by_role = "seller"
     else:
         raise ValueError(f"Unrecognised user role: {user.role!r}")
@@ -117,7 +88,6 @@ async def add_item(
 
 
 # List cart for a customer
-
 async def list_for_customer(
     db: AsyncSession,
     *,
@@ -222,7 +192,6 @@ async def list_for_customer(
 
 
 # Get a single cart_item by id (with hydration)
-
 async def get_hydrated(
     db: AsyncSession, cart_item_id: int
 ) -> Optional[dict]:
@@ -284,7 +253,6 @@ async def get_hydrated(
 
 
 # Update quantity
-
 async def update_quantity(
     db: AsyncSession,
     *,
@@ -311,7 +279,6 @@ async def update_quantity(
 
 
 # Update status (sold / not_sold) without purchase_history write
-
 async def update_status(
     db: AsyncSession,
     *,
@@ -347,7 +314,6 @@ async def update_status(
 
 
 # Delete a cart line
-
 async def delete_item(
     db: AsyncSession,
     *,
@@ -372,7 +338,6 @@ async def delete_item(
 
 
 # Checkout: mark sold AND write purchase_history
-
 async def checkout_item(
     db: AsyncSession,
     *,
@@ -397,9 +362,6 @@ async def checkout_item(
             "cannot check out a line that's already resolved."
         )
 
-    # The seller_id stamped on the purchase row depends on who is acting.
-    # For sellers, that's their own user_id. For admins, also their user_id
-    # (admin acting as a seller). For customers, it's left null.
     if user.role in ("seller", "admin"):
         sold_by = user.user_id
     else:

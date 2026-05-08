@@ -29,8 +29,6 @@ router = APIRouter(tags=["stats"])
 
 
 # Auth helpers
-
-
 def _require_admin(user: User) -> None:
     if user.role != "admin":
         raise HTTPException(
@@ -47,11 +45,6 @@ def _require_seller(user: User) -> User:
         )
     return user
 
-
-
-# /admin/stats/overview
-
-
 @router.get(
     "/admin/stats/overview",
     response_model=OverviewResponse,
@@ -64,11 +57,6 @@ async def admin_overview(
     _require_admin(user)
     data = await stats_service.get_overview(db)
     return OverviewResponse(**data)
-
-
-
-# /admin/stats/sales-trend
-
 
 @router.get(
     "/admin/stats/sales-trend",
@@ -91,11 +79,6 @@ async def admin_sales_trend(
     data = await stats_service.get_sales_trend(db, granularity, range)
     return SalesTrendResponse(**data)
 
-
-
-# /admin/stats/conversion-by-signal
-
-
 @router.get(
     "/admin/stats/conversion-by-signal",
     response_model=ConversionBySignalResponse,
@@ -109,11 +92,6 @@ async def admin_conversion_by_signal(
     data = await stats_service.get_conversion_by_signal(db, seller_id=None)
     return ConversionBySignalResponse(**data)
 
-
-
-# /admin/stats/segment-distribution
-
-
 @router.get(
     "/admin/stats/segment-distribution",
     response_model=SegmentDistributionResponse,
@@ -125,11 +103,6 @@ async def admin_segment_distribution(
     _require_admin(user)
     data = await stats_service.get_segment_distribution()
     return SegmentDistributionResponse(**data)
-
-
-
-# /admin/stats/top-sellers
-
 
 @router.get(
     "/admin/stats/top-sellers",
@@ -145,11 +118,6 @@ async def admin_top_sellers(
     _require_admin(user)
     data = await stats_service.get_top_sellers(db, limit=limit, range_str=range)
     return TopSellersResponse(**data)
-
-
-
-# /admin/stats/recent-sales
-
 
 @router.get(
     "/admin/stats/recent-sales",
@@ -168,11 +136,6 @@ async def admin_recent_sales(
     _require_admin(user)
     data = await stats_service.get_recent_sales(db, limit=limit, since=since)
     return RecentSalesResponse(**data)
-
-
-
-# /customers/{cust_id}/stats
-
 
 @router.get(
     "/customers/{cust_id}/stats",
@@ -229,11 +192,6 @@ async def customer_stats(
 
     return CustomerStatsResponse(**data)
 
-
-
-# /sellers/me/stats
-
-
 @router.get(
     "/sellers/me/stats",
     response_model=SellerStatsResponse,
@@ -263,11 +221,6 @@ async def my_seller_stats(
 
     return SellerStatsResponse(**data)
 
-
-
-# /sellers/me/conversion-by-signal
-
-
 @router.get(
     "/sellers/me/conversion-by-signal",
     response_model=ConversionBySignalResponse,
@@ -283,9 +236,6 @@ async def my_seller_conversion_by_signal(
     )
     return ConversionBySignalResponse(**data)
 
-
-# /admin/stats/top-customers
-
 @router.get(
     "/admin/stats/top-customers",
     response_model=TopCustomersResponse,
@@ -300,9 +250,6 @@ async def admin_top_customers(
     _require_admin(user)
     data = await stats_service.get_top_customers(db, limit=limit, range_str=range)
     return TopCustomersResponse(**data)
-
-# /admin/stats/engine-effectiveness
-
 
 @router.get(
     "/admin/stats/engine-effectiveness",
@@ -320,9 +267,6 @@ async def admin_engine_effectiveness(
 
 from backend.schemas.stats import ChurnFunnelResponse
 
-
-# /admin/stats/churn-funnel
-
 @router.get(
     "/admin/stats/churn-funnel",
     response_model=ChurnFunnelResponse,
@@ -335,4 +279,3 @@ async def admin_churn_funnel(
     _require_admin(user)
     data = await stats_service.get_churn_funnel(db)
     return ChurnFunnelResponse(**data)
-

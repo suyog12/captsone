@@ -27,10 +27,7 @@ from backend.services import (
 router = APIRouter(tags=["customers"])
 
 
-# ---------------------------------------------------------------------------
 # GET /customers/search
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/customers/search",
     response_model=list[CustomerSearchResult],
@@ -88,10 +85,7 @@ async def search_customers(
     return out
 
 
-# ---------------------------------------------------------------------------
 # GET /customers/filter
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/customers/filter",
     response_model=CustomerListResponse,
@@ -202,10 +196,7 @@ async def filter_customers(
     )
 
 
-# ---------------------------------------------------------------------------
 # POST /customers/record - create customer record only, no login
-# ---------------------------------------------------------------------------
-
 @router.post(
     "/customers/record",
     response_model=CustomerResponse,
@@ -248,10 +239,7 @@ async def create_customer_record(
     return response
 
 
-# ---------------------------------------------------------------------------
 # GET /customers/me - the logged-in customer's own record
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/customers/me",
     response_model=CustomerResponse,
@@ -284,10 +272,7 @@ async def get_my_customer_record(
     return response
 
 
-# ---------------------------------------------------------------------------
 # GET /customers/{cust_id}
-# ---------------------------------------------------------------------------
-
 @router.get(
     "/customers/{cust_id}",
     response_model=CustomerResponse,

@@ -8,10 +8,7 @@ import { useAuth } from '../auth.jsx';
 const DEMO_USERS = [
   { label: 'Admin', username: 'admin', role: 'admin' },
   { label: 'Seller', username: 'seller', role: 'seller' },
-  { label: 'Customer (stable)', username: 'demo_po_enterprise_stable_7626', role: 'customer' },
-  { label: 'Customer (declining)', username: 'demo_ltc_enterprise_declining_6753', role: 'customer' },
-  { label: 'Customer (churned)', username: 'demo_ltc_large_churned_0500', role: 'customer' },
-  { label: 'Customer (cold start)', username: 'demo_po_new_cold_7181', role: 'customer' }
+  { label: 'Customer (stable)', username: 'demo_po_enterprise_stable_8284', role: 'customer' }
 ];
 
 function defaultPathForRole(role) {

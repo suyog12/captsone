@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 
 # Single assignment / reassignment
-
 class AssignmentChangeRequest(BaseModel):
     """Body for PATCH /customers/{cust_id}/assignment.
 
@@ -41,7 +40,6 @@ class AssignmentChangeResponse(BaseModel):
 
 
 # Seller claim
-
 class ClaimRequest(BaseModel):
     """Body for POST /customers/{cust_id}/claim. No fields required.
 
@@ -57,7 +55,6 @@ class ClaimRequest(BaseModel):
 
 
 # Bulk assign
-
 class BulkAssignRequest(BaseModel):
     """Body for POST /customers/assignments/bulk."""
 
@@ -92,7 +89,6 @@ class BulkAssignResponse(BaseModel):
 
 
 # Assignment history
-
 class AssignmentHistoryEntry(BaseModel):
     """One row from customer_assignment_history."""
 
@@ -118,7 +114,6 @@ class AssignmentHistoryResponse(BaseModel):
 
 
 # Seller's customers
-
 class SellerCustomerListResponse(BaseModel):
     """Response from GET /sellers/{user_id}/customers."""
 
@@ -129,7 +124,6 @@ class SellerCustomerListResponse(BaseModel):
 
 
 # Deactivation summary (extends UserResponse)
-
 class SellerDeactivationResponse(BaseModel):
     """Response from DELETE /users/{user_id} when target is a seller.
 

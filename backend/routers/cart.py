@@ -235,7 +235,6 @@ async def view_my_cart(
 
 
 # PATCH /cart/{cart_item_id}  (update quantity)
-
 @router.patch(
     "/cart/{cart_item_id}",
     response_model=CartLineResponse,
@@ -267,7 +266,6 @@ async def update_quantity(
 
 
 # PATCH /cart/{cart_item_id}/status  (mark sold or not_sold)
-
 @router.patch(
     "/cart/{cart_item_id}/status",
     response_model=CartLineResponse,
@@ -303,7 +301,6 @@ async def update_status(
 
 
 # DELETE /cart/{cart_item_id}
-
 @router.delete(
     "/cart/{cart_item_id}",
     status_code=status.HTTP_200_OK,
@@ -335,7 +332,6 @@ async def delete_cart_item(
 
 
 # POST /cart/{cart_item_id}/checkout
-
 @router.post(
     "/cart/{cart_item_id}/checkout",
     response_model=CartCheckoutResponse,

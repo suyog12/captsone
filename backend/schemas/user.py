@@ -8,7 +8,6 @@ from pydantic import BaseModel, EmailStr, Field
 
 class UserResponse(BaseModel):
     """Public user record returned by API."""
-
     user_id: int
     username: str
     role: str
@@ -24,7 +23,6 @@ class UserResponse(BaseModel):
 
 class AdminCreateRequest(BaseModel):
     """Body for POST /users/admins."""
-
     username: str = Field(min_length=3, max_length=100)
     password: str = Field(min_length=6, max_length=200)
     full_name: Optional[str] = Field(None, max_length=200)
@@ -33,7 +31,6 @@ class AdminCreateRequest(BaseModel):
 
 class SellerCreateRequest(BaseModel):
     """Body for POST /users/sellers."""
-
     username: str = Field(min_length=3, max_length=100)
     password: str = Field(min_length=6, max_length=200)
     full_name: Optional[str] = Field(None, max_length=200)
@@ -46,12 +43,10 @@ SizeTier = Literal["new", "small", "mid", "large", "enterprise"]
 
 class CustomerCreateRequest(BaseModel):
     """Body for POST /users/customers.
-
     assigned_seller_id is honored only when the caller is an admin. When a
     seller calls this endpoint, the new customer is always auto-assigned
     to that seller (the field is ignored).
     """
-
     username: str = Field(min_length=3, max_length=100)
     password: str = Field(min_length=6, max_length=200)
     full_name: Optional[str] = Field(None, max_length=200)
@@ -68,13 +63,11 @@ class CustomerCreateRequest(BaseModel):
 
 class PasswordChangeRequest(BaseModel):
     """Body for PATCH /users/me/password."""
-
     current_password: str = Field(min_length=1)
     new_password: str = Field(min_length=6, max_length=200)
 
 
 class UserListResponse(BaseModel):
     """Response from GET /users."""
-
     total: int
     items: list[UserResponse]

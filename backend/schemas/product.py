@@ -1,5 +1,3 @@
-"""Pydantic schemas for the product catalog endpoints."""
-
 from __future__ import annotations
 
 from typing import Optional

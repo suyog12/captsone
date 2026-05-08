@@ -1,12 +1,3 @@
-"""
-Product catalog endpoints.
-
-  GET /products              - Browse the catalog with filters and pagination
-  GET /products/filters      - Available filter options (families, categories, suppliers)
-
-All authenticated roles can access.
-"""
-
 from __future__ import annotations
 
 from typing import Optional

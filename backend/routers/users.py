@@ -28,7 +28,6 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 # Create users
-
 @router.post(
     "/admins",
     response_model=UserResponse,
@@ -118,7 +117,6 @@ async def create_customer(
 
 
 # Read users
-
 @router.get(
     "",
     response_model=UserListResponse,
@@ -144,7 +142,6 @@ async def list_users(
         items=[UserResponse.model_validate(r) for r in rows],
     )
 
-
 @router.get(
     "/{user_id}",
     response_model=UserResponse,
@@ -165,7 +162,6 @@ async def get_user(
 
 
 # Password change
-
 @router.patch(
     "/me/password",
     response_model=UserResponse,
@@ -191,7 +187,6 @@ async def change_my_password(
 
 
 # Soft delete (deactivate) / reactivate
-
 @router.delete(
     "/{user_id}",
     response_model=SellerDeactivationResponse,
@@ -307,9 +302,6 @@ async def attach_login_to_customer(
             detail=f"Customer {cust_id} not found.",
         )
 
-    # Sellers can only attach a login to their own assigned customers.
-    # Without this check, a seller could give themselves a backdoor by
-    # creating a login for a colleague's customer. Admins are unrestricted.
     if user.role == "seller":
         if customer.assigned_seller_id != user.user_id:
             raise HTTPException(
@@ -328,8 +320,6 @@ async def attach_login_to_customer(
         )
     except ValueError as e:
         msg = str(e)
-        # "Customer not found" should not happen here (we just checked)
-        # but map it cleanly anyway. Username/account collisions are 409.
         if "not found" in msg.lower():
             raise HTTPException(status_code=404, detail=msg)
         raise HTTPException(status_code=409, detail=msg)

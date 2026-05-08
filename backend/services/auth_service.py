@@ -43,7 +43,6 @@ async def login(
     user = await authenticate(db, username, password)
     if user is None:
         return None
-
     # Update last_login_at. We commit inside the function because this
     # is a side effect of login that should persist even if the caller
     # does not commit explicitly.
@@ -56,5 +55,4 @@ async def login(
         extra_claims={"user_id": user.user_id, "role": user.role},
         expires_minutes=settings.jwt_expire_minutes,
     )
-
     return user, token

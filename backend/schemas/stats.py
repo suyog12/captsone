@@ -6,11 +6,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-
-
 # Common helpers
-
-
 class CodeAndDisplay(BaseModel):
     """A code value plus its human-readable display name.
 
@@ -22,10 +18,7 @@ class CodeAndDisplay(BaseModel):
     display_name: str
 
 
-
 # /admin/stats/overview
-
-
 class CustomerPopulationBlock(BaseModel):
     """Counts split between analytical population and active operational accounts."""
     total_customers: int = Field(..., description="All customers in the analytical Parquet file.")
@@ -66,8 +59,6 @@ class OverviewResponse(BaseModel):
 
 
 # /admin/stats/sales-trend
-
-
 class SalesTrendBucket(BaseModel):
     """One time bucket of sales aggregations."""
     bucket: str = Field(..., description="Bucket label. For daily: 'YYYY-MM-DD'. For weekly: 'YYYY-Www'. For monthly: 'YYYY-MM'.")
@@ -90,8 +81,6 @@ class SalesTrendResponse(BaseModel):
 
 # /admin/stats/conversion-by-signal
 # /sellers/me/conversion-by-signal
-
-
 class SignalConversionRow(BaseModel):
     """Conversion stats for one cart_items.source value."""
     source: CodeAndDisplay
@@ -115,8 +104,6 @@ class ConversionBySignalResponse(BaseModel):
 
 
 # /admin/stats/segment-distribution
-
-
 class SegmentDistributionRow(BaseModel):
     """One slice of the customer-segment pie chart."""
     segment_code: str = Field(..., description="Combined market + size code, e.g. 'PO_large'.")
@@ -134,8 +121,6 @@ class SegmentDistributionResponse(BaseModel):
 
 
 # /admin/stats/top-sellers
-
-
 class TopSellerRow(BaseModel):
     seller_id: int
     seller_username: str
@@ -156,8 +141,6 @@ class TopSellersResponse(BaseModel):
 
 
 # /admin/stats/recent-sales
-
-
 class RecentSaleRow(BaseModel):
     """One row in the live sales feed."""
     purchase_id: int
@@ -191,8 +174,6 @@ class RecentSalesResponse(BaseModel):
 
 # /customers/{cust_id}/stats
 # /sellers/me/stats
-
-
 class CustomerStatsHeader(BaseModel):
     cust_id: int
     customer_name: Optional[str] = None
@@ -278,7 +259,6 @@ class SellerStatsResponse(BaseModel):
 
 
 # Top customers leaderboard
-
 class TopCustomerRow(BaseModel):
     cust_id: int
     customer_name: Optional[str] = None

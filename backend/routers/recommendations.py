@@ -109,12 +109,6 @@ async def customer_recommendations(
 
 
 # Reject
-
-# /recommendations/reject  -  seller marks a rec as not useful, with a reason.
-# Writes a row to recommendation_events with outcome='rejected'. The reason
-# code lets us aggregate failure modes by category later (e.g. "engine
-# over-recommends already-owned items in pediatrics"). Free-text note is
-# optional and capped at 2000 chars by the schema.
 @router.post(
     "/reject",
     response_model=RejectRecommendationResponse,
@@ -157,9 +151,6 @@ async def reject_recommendation(
             ),
         )
 
-    # Try to find an existing pending rec event (created when the rec was
-    # surfaced) and update it. If none exists, insert a fresh row - this
-    # keeps the endpoint useful even before the surface-side logging is wired.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     existing = await db.execute(
         select(RecommendationEvent)

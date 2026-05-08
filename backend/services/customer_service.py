@@ -15,7 +15,6 @@ async def get_by_id(db: AsyncSession, cust_id: int) -> Optional[Customer]:
     """Fetch one customer by cust_id, or None if not found."""
     return await db.get(Customer, cust_id)
 
-
 async def search(
     db: AsyncSession,
     query: str,
@@ -45,9 +44,6 @@ async def search(
         except ValueError:
             return []
     else:
-        # Text: match against market_code, specialty_code, segment,
-        # or customer_name (so newly-created records with a populated
-        # business name are searchable by name as well).
         upper_q = q.upper()
         like_q = f"%{q}%"
         stmt = stmt.where(
@@ -83,9 +79,7 @@ async def search_by_filters(
 ) -> list[Customer]:
     """
     Filtered customer browsing.
-
     All filters combine with AND.
-
     account_status valid values:
       - None or 'all' (default, no account filter)
       - 'users'    - only customers WITH a dashboard login
@@ -165,7 +159,6 @@ async def get_user_account_map(
 
 
 # Internal: shared filter builder
-
 def _apply_filters(
     stmt,
     *,

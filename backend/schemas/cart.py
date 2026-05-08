@@ -38,7 +38,6 @@ class AddToCartRequest(BaseModel):
 
 
 # Update quantity
-
 class UpdateCartQuantityRequest(BaseModel):
     """Body for PATCH /cart/{cart_item_id}."""
 
@@ -46,7 +45,6 @@ class UpdateCartQuantityRequest(BaseModel):
 
 
 # Update status (mark sold or not_sold)
-
 class UpdateCartStatusRequest(BaseModel):
     """Body for PATCH /cart/{cart_item_id}/status."""
 
@@ -57,7 +55,6 @@ class UpdateCartStatusRequest(BaseModel):
 
 
 # Single cart line response
-
 class CartLine(BaseModel):
     """One row of cart_items, hydrated with product description and stock."""
 
@@ -85,7 +82,6 @@ class CartLine(BaseModel):
 
 
 # Cart view response
-
 class CartViewResponse(BaseModel):
     """Response from GET /customers/{cust_id}/cart and GET /cart/me."""
 
@@ -105,7 +101,6 @@ class CartViewResponse(BaseModel):
 
 
 # Single update response
-
 class CartLineResponse(BaseModel):
     """Response from POST/PATCH/DELETE /cart endpoints. Returns the affected line."""
 
@@ -114,7 +109,6 @@ class CartLineResponse(BaseModel):
 
 
 # Checkout response
-
 class CartCheckoutResponse(BaseModel):
     """Response from POST /cart/{cart_item_id}/checkout."""
 

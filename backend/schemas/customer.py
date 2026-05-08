@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 
 # Single customer record - returned by GET /customers/{cust_id} and /customers/me
-
 class CustomerResponse(BaseModel):
     """Full customer record returned by GET /customers/{cust_id} and /customers/me."""
 
@@ -28,10 +27,8 @@ class CustomerResponse(BaseModel):
     is_assigned_to_me: Optional[bool] = None
 
     model_config = {"from_attributes": True}
-
-
+    
 # Customer search/filter result - returned by /customers/search and /customers/filter
-
 class CustomerSearchResult(BaseModel):
     """A single hit in a customer search response."""
 
@@ -61,7 +58,6 @@ class CustomerListResponse(BaseModel):
     'total' is the total number of customers matching the filter set
     across all pages. 'limit' and 'offset' echo the request parameters.
     """
-
     total: int = Field(..., description="Total customers matching the filters across all pages")
     limit: int = Field(..., description="Page size used for this response")
     offset: int = Field(..., description="Offset used for this response (0-based)")
@@ -69,14 +65,12 @@ class CustomerListResponse(BaseModel):
 
 
 # Customer record creation - no login
-
 class CustomerRecordCreateRequest(BaseModel):
     """Minimal customer record - no user/login is created.
 
     Used by the seller workflow (auto-assigns to current seller) and
     by admins who want to create a customer without a login account.
     """
-
     customer_business_name: str = Field(
         ..., min_length=2, max_length=200,
         description="Display name for the customer (clinic, hospital, practice, etc.)"

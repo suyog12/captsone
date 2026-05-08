@@ -15,8 +15,6 @@ will register it normally.
 """
 
 # /customers/record
-
-
 @router.post(
     "/record",
     response_model=CustomerResponse,

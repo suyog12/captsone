@@ -94,14 +94,6 @@ def _query_precomputed(cust_id: int, n: int = 10) -> pd.DataFrame:
         [str(RECOMMENDATIONS_FILE), int(cust_id), int(n)],
     )
 
-
-# Top-N recommendations: cold-start fallback
-# Rules:
-#  - Sort by recent_buyer_count_6mo DESC (recent popularity beats lifetime
-#    popularity)
-#  - Filter out is_discontinued = 1 products
-#  - If customer has a specialty_code, prefer items where top_specialty_1
-#    matches the customer's specialty (specialty match wins ties)
 def _query_cold_start(
     segment: Optional[str],
     specialty: Optional[str],

@@ -254,11 +254,7 @@ async def reactivate(db: AsyncSession, user_id: int) -> Optional[User]:
     await db.refresh(user)
     return user
 
-
-# ============================================================================
 # Create customer record only - no login (used by POST /customers/record)
-# ============================================================================
-
 async def create_customer_record_only(
     db: AsyncSession,
     *,
@@ -311,7 +307,7 @@ async def create_customer_record_only(
     return customer
 
 
-# === BEGIN APPENDED 20260501-043628 ===
+# BEGIN APPENDED 20260501-043628
 """
 Append this function to the END of backend/services/user_service.py.
 
@@ -322,8 +318,6 @@ Used by the new POST /users/customers/{cust_id}/login endpoint.
 """
 
 # Append below this line into user_service.py
-# ============================================================================
-
 
 async def attach_login_to_customer(
     db: AsyncSession,
@@ -369,5 +363,3 @@ async def attach_login_to_customer(
         commit=True,
     )
     return user
-
-# === END APPENDED 20260501-043628 ===
