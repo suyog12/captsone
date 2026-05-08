@@ -94,7 +94,7 @@ export default function LoginPage() {
           </p>
           <div className="mt-10 grid grid-cols-3 gap-4 max-w-md">
             <Stat label="Signal types" value="8" />
-            <Stat label="API endpoints" value="42" />
+            <Stat label="API endpoints" value="53" />
             <Stat label="QC pass rate" value="99.2%" />
           </div>
         </div>
